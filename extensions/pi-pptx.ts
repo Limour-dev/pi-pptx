@@ -28,8 +28,11 @@ const KIT =
 	process.env.PI_PPTKIT_PY ||
 	fileURLToPath(new URL("../python/pptkit.py", import.meta.url));
 
-const MAX_SHOT_PAGES = 4;
-const MAX_MONTAGE_PAGES = 12;
+const MAX_SHOT_PAGES = 6;
+// A montage is ONE image, so the per-image token cost does not grow with it.
+const MAX_MONTAGE_PAGES = 60;
+// Below this the contact-sheet cells cannot be read for proofreading.
+const MONTAGE_LEGIBLE_DPI = 100;
 
 type KitResult = Record<string, any>;
 
@@ -118,29 +121,24 @@ function jsonResult(data: KitResult, summary?: string) {
 	};
 }
 
+/**
+ * One-line pointer to the flags. The boxes, ids and reasons live in
+ * `overflow[]` / `overlaps[]` / `suppressed[]`; repeating them as prose made
+ * the same warnings appear twice in every reply.
+ */
 function shotWarnings(data: KitResult): string {
-	const warnings: string[] = [];
-	const overflow = (data.shots ?? []).filter((shot: any) => shot.overflow?.length);
-	if (overflow.length) {
-		const parts = overflow.map((shot: any) => {
-			const shapes = shot.overflow.map((item: any) => item.shape).join(", ");
-			return `slide ${shot.slide}: ${shapes}`;
-		});
-		warnings.push(
-			`WARNING text overflow (heuristic): ${parts.join("; ")}. Fix by resizing the shape, reducing text, or lowering the font size, then ppt_shot again.`,
-		);
+	const parts: string[] = [];
+	for (const shot of data.shots ?? []) {
+		const flags = [
+			...(shot.overflow ?? []).length ? [`overflow ${shot.overflow.map((i: any) => i.shape).join("/")}`] : [],
+			...(shot.overlaps ?? []).length
+				? [`overlap ${shot.overlaps.map((i: any) => `${i.a}x${i.b}`).join("/")}`]
+				: [],
+		];
+		if (flags.length) parts.push(`slide ${shot.slide}: ${flags.join(" ")}`);
 	}
-	const overlaps = (data.shots ?? []).filter((shot: any) => shot.overlaps?.length);
-	if (overlaps.length) {
-		const parts = overlaps.map((shot: any) => {
-			const pairs = shot.overlaps.map((item: any) => `${item.a} x ${item.b}`).join(", ");
-			return `slide ${shot.slide}: ${pairs}`;
-		});
-		warnings.push(
-			`WARNING shape overlap (heuristic): ${parts.join("; ")}. Check these boxes are intentional; move or resize if not.`,
-		);
-	}
-	return warnings.join("\n");
+	if (!parts.length) return "";
+	return `WARNING text overflow / shape overlap — ${parts.join("; ")}. Geometry is in overflow[]/overlaps[]; suppressed[] lists the sides and pairs that anchor/container rules skipped (not fixed).`;
 }
 
 const FONT_DESCRIPTION =
@@ -152,7 +150,7 @@ const inspectTool = defineTool({
 	name: "ppt_inspect",
 	label: "PPT Inspect",
 	promptSnippet: "Inspect PPTX layouts, shapes (names, paths, inch boxes, text), tables and notes.",
-	description: `Read a PPTX: slide size/count, every layout (index, name, placeholders), and for the requested slides the full shape tree with names, recursive paths ("组合 7/矩形 9"), inch boxes, text, tables, pictures and notes.
+	description: `Read a PPTX: slide size/count, every layout (index, name, placeholders, and the non-placeholder shapes each layout draws — logos, rules, full-bleed backgrounds marked \`inherited: true\`), and for the requested slides the full shape tree with names, recursive paths ("组合 7/矩形 9"), inch boxes, text, tables, pictures and notes.
 
 Call this before editing: use the returned shape paths verbatim and 1-based slide numbers. Pass \`slides\` (e.g. "1,3" or "2-4") to inspect only some pages; otherwise all pages are returned.`,
 	parameters: Type.Object({
@@ -191,28 +189,49 @@ const shotTool = defineTool({
 	promptSnippet: "Render PPTX slides to PNG images (with overflow warnings) so you can see the result.",
 	description: `Render slides of a PPTX to PNG and return the images plus a JSON report. This is how you SEE a deck: use it to pick a style parent from a template's sample pages and to self-check every edit (overflow, wrapping, overlap, font size).
 
-- Returns at most ${MAX_SHOT_PAGES} images per call (${MAX_MONTAGE_PAGES} when \`montage\` is set). If \`slides\` is omitted it renders from slide 1 and reports the rest in \`omitted_slides\`; call again with explicit slide numbers for more.
-- \`dpi\`: 80 for an overview, 110 (default) for normal checking, 150 for fine detail.
-- \`montage\`: one contact sheet (e.g. 3 columns) instead of N separate images — best for reviewing a whole deck's rhythm.
-- \`region\`: crop [x,y,w,h] in inches (e.g. a small table) without re-rendering the whole slide.
-- \`overflow\`: "loose" (default; skips left/right checks on centred text), "strict" (report every side), "off". \`ignore\` skips named shapes.
-- Report fields: \`shots[].overflow\` (rendered text exceeds the shape box), \`shots[].overlaps\` (text collides with another text/picture/table), \`cache_hit\`, \`pdf\`.
-- Rendering is cached by content hash: re-shooting an unchanged deck is fast. CJK font substitution can differ ~5% from PowerPoint — leave a little margin.`,
+- Returns at most ${MAX_SHOT_PAGES} images per call. With \`montage\` it returns ONE contact sheet and can cover up to ${MAX_MONTAGE_PAGES} slides, so a whole deck fits in one call; the rest is reported in \`omitted_slides\`.
+- \`onlyChanged: true\` renders just the slides the last edit touched (\`changedSlides\` if you pass them). Use this in an edit loop instead of re-shooting every page.
+- \`dpi\`: 80 for rhythm, 110 (default) for checking, 150 for fine detail. A contact sheet cell is ~640px wide — at that size 12pt footnotes are illegible, so proofread text at ${MONTAGE_LEGIBLE_DPI}+ dpi on a single page.
+- \`montage\`: one contact sheet (e.g. 3 columns) instead of N separate images — best for reviewing a whole deck's rhythm and pagination.
+- \`region\`: crop [x,y,w,h] in inches, globally or per page: {"3": [x,y,w,h], "default": [...]}.
+- \`overflow\`: "loose" (default; skips left/right checks on centred text), "strict" (report every side), "off".
+- \`ignore\`: skip shapes by name, "#<id>" or "/regex/" — stable across rebuilds.
+- \`density: true\` adds a per-slide table (first line, rendered lines vs. estimated capacity) so pagination problems show up without opening every image.
+- A side of the box is only reported when the text anchor allows it: top-anchored first lines never "overflow" upwards. \`suppressed[]\` lists what the anchor/container rules skipped, so "clean" and "not checked" stay distinguishable.
+- Report fields: \`shots[].overflow\`, \`shots[].overlaps\`, \`suppressed[]\`, \`font_substitutions\` (rendering != PowerPoint), \`cache_hit\`, \`pdf\`.`,
 	parameters: Type.Object({
 		path: PPT_PATH,
 		slides: Type.Optional(
-			Type.String({ description: "Slides to render, e.g. '2' or '1,3'. Default: from slide 1." }),
+			Type.String({ description: "Slides to render, e.g. '2' or '1,3' or '1-60'. Default: from slide 1." }),
 		),
 		dpi: Type.Optional(Type.Number({ description: "Raster DPI. Default 110.", minimum: 40, maximum: 300 })),
 		montage: Type.Optional(
 			Type.Number({ description: "Output a contact sheet with this many columns. Default: off.", minimum: 1, maximum: 6 }),
 		),
 		region: Type.Optional(
-			Type.Array(Type.Number(), {
-				description: "Crop each rendered slide to [x,y,w,h] in inches.",
-				minItems: 4,
-				maxItems: 4,
+			Type.Union([
+				Type.Array(Type.Number(), {
+					description: "Crop every rendered slide to [x,y,w,h] in inches.",
+					minItems: 4,
+					maxItems: 4,
+				}),
+				Type.Record(Type.String(), Type.Array(Type.Number()), {
+					description: 'Per-page crops, e.g. {"3": [x,y,w,h], "default": [x,y,w,h]}.',
+				}),
+			]),
+		),
+		onlyChanged: Type.Optional(
+			Type.Boolean({
+				description: "Render only the slides touched by the last edit (or changedSlides). Default false.",
 			}),
+		),
+		changedSlides: Type.Optional(
+			Type.Array(Type.Number(), {
+				description: "Slides considered changed, for onlyChanged. Default: whatever the edit reported.",
+			}),
+		),
+		density: Type.Optional(
+			Type.Boolean({ description: "Include a per-slide lines/capacity table. Default false." }),
 		),
 		overflow: Type.Optional(
 			Type.Union([Type.Literal("loose"), Type.Literal("strict"), Type.Literal("off")], {
@@ -220,7 +239,9 @@ const shotTool = defineTool({
 			}),
 		),
 		ignore: Type.Optional(
-			Type.Array(Type.String(), { description: "Shape names to skip in overflow/overlap checks." }),
+			Type.Array(Type.String(), {
+				description: "Shapes to skip in overflow/overlap checks: name, '#<id>' or '/regex/'.",
+			}),
 		),
 	}),
 	annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
@@ -229,7 +250,12 @@ const shotTool = defineTool({
 		const args = ["shot", params.path, "--dpi", String(params.dpi ?? 110), "--max-pages", String(limit)];
 		if (params.slides) args.push("--slides", params.slides);
 		if (params.montage != null) args.push("--montage", String(params.montage));
-		if (params.region) args.push("--region", params.region.join(","));
+		if (params.region) {
+			args.push("--region", Array.isArray(params.region) ? params.region.join(",") : JSON.stringify(params.region));
+		}
+		if (params.onlyChanged) args.push("--only-changed");
+		if (params.changedSlides?.length) args.push("--changed-slides", params.changedSlides.join(","));
+		if (params.density) args.push("--density");
 		if (params.overflow) args.push("--overflow", params.overflow);
 		if (params.ignore?.length) args.push("--ignore", params.ignore.join(","));
 		const data = await execKit(args, ctx.cwd, signal);
@@ -241,7 +267,11 @@ const shotTool = defineTool({
 			dpi: data.dpi,
 			cache_hit: data.cache_hit,
 			overflow_mode: data.overflow_mode,
+			shot_slides: data.shot_slides,
 			shots: data.shots,
+			...(data.density ? { density: data.density } : {}),
+			...(data.font_substitutions ? { font_substitutions: data.font_substitutions, render_note: data.render_note } : {}),
+			...(data.no_changes ? { no_changes: true, hint: data.hint } : {}),
 			...(data.montage ? { montage: data.montage } : {}),
 			...(data.omitted_slides ? { omitted_slides: data.omitted_slides, hint: data.hint } : {}),
 		};
@@ -278,6 +308,8 @@ const shotTool = defineTool({
 					overlaps: shot.overlaps ?? [],
 				})),
 				montage: data.montage,
+				density: data.density,
+				font_substitutions: data.font_substitutions,
 				omitted_slides: data.omitted_slides,
 			},
 		};
@@ -432,7 +464,12 @@ const setCellTool = defineTool({
 		shape: Type.String({ description: "Table shape name or path." }),
 		row: Type.Number({ description: "0-based row index.", minimum: 0 }),
 		col: Type.Number({ description: "0-based column index.", minimum: 0 }),
-		text: Type.String(),
+		text: Type.Optional(Type.String({ description: "Cell text. Omit when using cellRuns." })),
+		cellRuns: Type.Optional(
+			Type.Array(Type.Record(Type.String(), Type.Any()), {
+				description: "Rich text for this cell: [{t,bold,color,size}]; each run inherits the cell's style.",
+			}),
+		),
 		out: OUT,
 	}),
 	annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -448,9 +485,10 @@ const setCellTool = defineTool({
 			String(params.row),
 			"--col",
 			String(params.col),
-			"--text",
-			params.text,
 		];
+		if (params.cellRuns) args.push("--cell-runs", JSON.stringify(params.cellRuns));
+		else if (params.text != null) args.push("--text", params.text);
+		else throw new Error("ppt_set_cell needs either text or cellRuns");
 		if (params.out) args.push("--out", params.out);
 		const data = await mutate(ctx, signal, params.path, args);
 		return jsonResult(data, `slide ${params.slide} ${params.shape}[${params.row}][${params.col}] updated`);
@@ -494,6 +532,8 @@ New text does not inherit the template's text styling. Pass \`font\`, \`size\` a
 			Type.Union([Type.String(), Type.Boolean()], { description: "Bullet glyph ('•'), true for '•', false/none to disable." }),
 		),
 		bulletColor: Type.Optional(Type.String({ description: "Bullet color, e.g. #2E75B6." })),
+		letterSpacing: Type.Optional(Type.Number({ description: "Tracking in points (writes a:rPr/@spc)." })),
+		name: Type.Optional(Type.String({ description: "Text box name (stable handle for later ops)." })),
 		fit: Type.Optional(
 			Type.Union([Type.Literal("grow"), Type.Literal("shrink"), Type.Literal("none")], {
 				description: "Autofit mode. Default: grow when h is omitted, otherwise none.",
@@ -534,12 +574,93 @@ New text does not inherit the template's text styling. Pass \`font\`, \`size\` a
 			args.push("--bullet", params.bullet === true ? "•" : params.bullet === false ? "none" : params.bullet);
 		}
 		if (params.bulletColor) args.push("--bullet-color", params.bulletColor);
+		if (params.letterSpacing != null) args.push("--letter-spacing", String(params.letterSpacing));
+		if (params.name) args.push("--name", params.name);
 		if (params.fit) args.push("--fit", params.fit);
 		if (params.out) args.push("--out", params.out);
 		const data = await mutate(ctx, signal, params.path, args);
 		return jsonResult(
 			data,
 			`added ${data.name} (#${data.id}) on slide ${params.slide} at [${data.box_in?.join(", ")}] in, fit=${data.fit}`,
+		);
+	},
+});
+
+const addShapeTool = defineTool({
+	name: "ppt_add_shape",
+	label: "PPT Add Shape",
+	promptSnippet: "Draw a shape (rounded card, accent bar, chevron, arrow, divider) with fill, border, text.",
+	description: `Draw one preset shape at inch coordinates. This is the primitive for designed layouts: cards, accent bars, process chevrons/arrows and dividers used to be impossible without leaving the tool layer.
+	
+- \`kind\`: rect | roundrect | chevron | arrow (alias rightArrow) | leftArrow | upArrow | downArrow | oval | triangle | hexagon | parallelogram | diamond | pentagon | bar | line. \`bar\`/\`line\` default to h=0.06 (an accent rule).
+- Styling: \`fill\`/\`line\` hex colors (or "none"), \`lineWidth\` (pt), \`radius\` (corner radius in inches, roundrect only). Shadow is OFF by default — inherited theme shadows are what make hand-made cards look muddy; pass \`shadow: true\` to keep it.
+- Text inside the shape is centred both ways by default (\`align\`, \`valign\` override); \`size\`/\`font\`/\`color\`/\`bold\`/\`letterSpacing\` apply to it.
+- \`name\` gives the shape a stable handle for later \`ignore\` / edits.
+- Text in a shape does not auto-grow: keep it short or set a taller \`h\`.`,
+	parameters: Type.Object({
+		path: PPT_PATH,
+		slide: SLIDE,
+		kind: Type.Optional(
+			Type.String({ description: "Shape preset. Default roundrect. See the tool description for the list." }),
+		),
+		x: Type.Number({ description: "Left, inches." }),
+		y: Type.Number({ description: "Top, inches." }),
+		w: Type.Number({ description: "Width, inches." }),
+		h: Type.Optional(Type.Number({ description: "Height, inches. Default: 0.06 for bar/line, else 0.6." })),
+		radius: Type.Optional(Type.Number({ description: "Corner radius in inches (roundrect)." })),
+		fill: Type.Optional(Type.String({ description: "Fill hex color, or 'none'." })),
+		line: Type.Optional(Type.String({ description: "Border hex color, or 'none'." })),
+		lineWidth: Type.Optional(Type.Number({ description: "Border width in points. Default 1." })),
+		shadow: Type.Optional(Type.Boolean({ description: "Keep the theme shadow. Default false." })),
+		text: Type.Optional(Type.String({ description: "Text inside the shape; \\n separates paragraphs." })),
+		paras: PARAS,
+		size: Type.Optional(Type.Number({ description: "Text size in points." })),
+		font: Type.Optional(Type.String({ description: FONT_DESCRIPTION })),
+		color: Type.Optional(Type.String({ description: "Text color, e.g. #1F4E79." })),
+		bold: Type.Optional(Type.Boolean()),
+		align: Type.Optional(Type.Union([Type.Literal("left"), Type.Literal("center"), Type.Literal("right")])),
+		valign: Type.Optional(Type.Union([Type.Literal("top"), Type.Literal("middle"), Type.Literal("bottom")])),
+		letterSpacing: Type.Optional(Type.Number({ description: "Tracking in points, e.g. 0.5." })),
+		name: Type.Optional(Type.String({ description: "Shape name (stable handle for later ops)." })),
+		out: OUT,
+	}),
+	annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+	async execute(_id, params, signal, _onUpdate, ctx) {
+		const args = [
+			"add-shape",
+			params.path,
+			"--slide",
+			String(params.slide),
+			"--kind",
+			params.kind ?? "roundrect",
+			"--x",
+			String(params.x),
+			"--y",
+			String(params.y),
+			"--w",
+			String(params.w),
+		];
+		if (params.h != null) args.push("--h", String(params.h));
+		if (params.radius != null) args.push("--radius", String(params.radius));
+		if (params.fill) args.push("--fill", params.fill);
+		if (params.line) args.push("--line", params.line);
+		if (params.lineWidth != null) args.push("--line-width", String(params.lineWidth));
+		if (params.shadow != null) args.push(params.shadow ? "--shadow" : "--no-shadow");
+		if (params.paras) args.push("--paras", JSON.stringify(params.paras));
+		else if (params.text != null) args.push("--text", params.text);
+		if (params.size != null) args.push("--size", String(params.size));
+		if (params.font) args.push("--font", params.font);
+		if (params.color) args.push("--color", params.color);
+		if (params.bold != null) args.push(params.bold ? "--bold" : "--no-bold");
+		if (params.align) args.push("--align", params.align);
+		if (params.valign) args.push("--valign", params.valign);
+		if (params.letterSpacing != null) args.push("--letter-spacing", String(params.letterSpacing));
+		if (params.name) args.push("--name", params.name);
+		if (params.out) args.push("--out", params.out);
+		const data = await mutate(ctx, signal, params.path, args);
+		return jsonResult(
+			data,
+			`added ${data.kind} "${data.name}" (#${data.id}) on slide ${params.slide} at [${data.box_in?.join(", ")}] in`,
 		);
 	},
 });
@@ -604,7 +725,19 @@ By default the theme's table style is DISABLED (no firstRow/bandRow, no tableSty
 		zebra: Type.Optional(Type.String({ description: "Even data-row fill, e.g. #EAF1F8." })),
 		border: Type.Optional(Type.String({ description: "Border color, or 'none'. Default #D9D9D9." })),
 		colWidths: Type.Optional(Type.Array(Type.Number(), { description: "Column widths in inches." })),
-		rowHeight: Type.Optional(Type.Number({ description: "Row height in inches." })),
+		rowHeight: Type.Optional(Type.Number({ description: "Body row height in inches." })),
+		headerHeight: Type.Optional(
+			Type.Number({ description: "Header row height in inches — often larger than body rows." }),
+		),
+		firstColBold: Type.Optional(Type.Boolean({ description: "Bold the first (label) column." })),
+		firstColColor: Type.Optional(Type.String({ description: "First column text color." })),
+		headerBorder: Type.Optional(Type.String({ description: "Separate border color for the header row." })),
+		cellRuns: Type.Optional(
+			Type.Array(Type.Array(Type.Array(Type.Record(Type.String(), Type.Any()))), {
+				description: "Per-cell rich text: cellRuns[row][col] = [{t,bold,color,size}]. Wins over data for that cell.",
+			}),
+		),
+		name: Type.Optional(Type.String({ description: "Table name (stable handle for later ops)." })),
 		aligns: Type.Optional(
 			Type.Array(Type.String(), { description: "Per-column alignment, cycling: left|center|right|justify." }),
 		),
@@ -641,6 +774,12 @@ By default the theme's table style is DISABLED (no firstRow/bandRow, no tableSty
 		if (params.border) args.push("--border", params.border);
 		if (params.colWidths?.length) args.push("--col-widths", params.colWidths.join(","));
 		if (params.rowHeight != null) args.push("--row-height", String(params.rowHeight));
+		if (params.headerHeight != null) args.push("--header-height", String(params.headerHeight));
+		if (params.firstColBold != null) args.push(params.firstColBold ? "--first-col-bold" : "--no-first-col-bold");
+		if (params.firstColColor) args.push("--first-col-color", params.firstColColor);
+		if (params.headerBorder) args.push("--header-border", params.headerBorder);
+		if (params.cellRuns) args.push("--cell-runs", JSON.stringify(params.cellRuns));
+		if (params.name) args.push("--name", params.name);
 		if (params.aligns?.length) args.push("--aligns", params.aligns.join(","));
 		if (params.out) args.push("--out", params.out);
 		const data = await mutate(ctx, signal, params.path, args);
@@ -648,6 +787,56 @@ By default the theme's table style is DISABLED (no firstRow/bandRow, no tableSty
 		return jsonResult(
 			data,
 			`added ${data.name} (#${data.id}, ${params.rows}x${params.cols}) on slide ${params.slide}${hint}`,
+		);
+	},
+});
+
+const setShapeTool = defineTool({
+	name: "ppt_set_shape",
+	label: "PPT Set Shape",
+	promptSnippet: "Move/resize a shape, restyle its fill/border, rename it, or change z-order.",
+	description: `Adjust an existing shape. Use it when a reused layout puts a placeholder somewhere you do not want (templates often place the title low and large), when a picture must be cropped in place, or when text has to sit above a picture.
+
+- Geometry: pass any of \`x\`/\`y\`/\`w\`/\`h\` in inches; omitted sides stay unchanged.
+- Style: \`fill\`, \`line\` (hex or "none"), \`lineWidth\` (pt), \`rotation\` (degrees).
+- \`z\`: "front" | "back" | "forward" | "backward" — top-level shapes only.
+- \`name\` renames the shape, giving later ops a stable handle.
+- The response reports \`box_before\` and the new \`box_in\` so you can spot a mis-sized placeholder at a glance.`,
+	parameters: Type.Object({
+		path: PPT_PATH,
+		slide: SLIDE,
+		shape: Type.String({ description: "Shape #id (preferred), unique name, path, or 0-based top-level index." }),
+		x: Type.Optional(Type.Number({ description: "New left, inches." })),
+		y: Type.Optional(Type.Number({ description: "New top, inches." })),
+		w: Type.Optional(Type.Number({ description: "New width, inches." })),
+		h: Type.Optional(Type.Number({ description: "New height, inches." })),
+		fill: Type.Optional(Type.String({ description: "Fill hex color, or 'none'." })),
+		line: Type.Optional(Type.String({ description: "Border hex color, or 'none'." })),
+		lineWidth: Type.Optional(Type.Number({ description: "Border width in points." })),
+		rotation: Type.Optional(Type.Number({ description: "Rotation in degrees." })),
+		z: Type.Optional(
+			Type.Union([Type.Literal("front"), Type.Literal("back"), Type.Literal("forward"), Type.Literal("backward")]),
+		),
+		name: Type.Optional(Type.String({ description: "Rename the shape." })),
+		out: OUT,
+	}),
+	annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
+	async execute(_id, params, signal, _onUpdate, ctx) {
+		const args = ["set-shape", params.path, "--slide", String(params.slide), "--shape", params.shape];
+		for (const key of ["x", "y", "w", "h"] as const) {
+			if (params[key] != null) args.push(`--${key}`, String(params[key]));
+		}
+		if (params.fill) args.push("--fill", params.fill);
+		if (params.line) args.push("--line", params.line);
+		if (params.lineWidth != null) args.push("--line-width", String(params.lineWidth));
+		if (params.rotation != null) args.push("--rotation", String(params.rotation));
+		if (params.z) args.push("--z", params.z);
+		if (params.name) args.push("--name", params.name);
+		if (params.out) args.push("--out", params.out);
+		const data = await mutate(ctx, signal, params.path, args);
+		return jsonResult(
+			data,
+			`slide ${params.slide} "${data.path}" (#${data.id}) box [${data.box_before?.join(", ")}] -> [${data.box_in?.join(", ")}]`,
 		);
 	},
 });
@@ -694,6 +883,30 @@ const setNotesTool = defineTool({
 	},
 });
 
+const notesCheckTool = defineTool({
+	name: "ppt_notes_check",
+	label: "PPT Notes Check",
+	promptSnippet: "List per-slide notes length and first characters to catch notes shifted by one page.",
+	description: `Report \`notes_len\` and the first 20 characters of every slide's speaker notes, next to that slide's title.
+
+Use it after deleting template pages (or after a batch of set_notes): writing notes and then deleting a slide shifts every note onto the neighbouring page while the deck still looks fine in the renderer. \`match: false\` plus a note that reads like the *previous* slide's topic is the tell.`,
+	parameters: Type.Object({
+		path: PPT_PATH,
+		slides: Type.Optional(Type.String({ description: "Slides to check, e.g. '1,3' or '2-4'. Default: all." })),
+	}),
+	annotations: { readOnlyHint: true, destructiveHint: false, openWorldHint: false },
+	async execute(_id, params, signal, _onUpdate, ctx) {
+		const args = ["notes-check", params.path];
+		if (params.slides) args.push("--slides", params.slides);
+		const data = await execKit(args, ctx.cwd, signal);
+		const missing = data.slides_without_notes?.length ?? 0;
+		return jsonResult(
+			data,
+			`${data.notes?.length ?? 0} slide(s) checked, ${missing} without notes`,
+		);
+	},
+});
+
 const tableStyleTool = defineTool({
 	name: "ppt_table_style",
 	label: "PPT Table Style",
@@ -721,7 +934,16 @@ const tableStyleTool = defineTool({
 		headerBold: Type.Optional(Type.Boolean({ description: "Bold header. Default true." })),
 		bodyBold: Type.Optional(Type.Boolean({ description: "Bold body cells." })),
 		colWidths: Type.Optional(Type.Array(Type.Number(), { description: "Column widths in inches." })),
-		rowHeight: Type.Optional(Type.Number({ description: "Row height in inches." })),
+		rowHeight: Type.Optional(Type.Number({ description: "Body row height in inches." })),
+		headerHeight: Type.Optional(Type.Number({ description: "Header row height in inches." })),
+		firstColBold: Type.Optional(Type.Boolean({ description: "Bold the first (label) column." })),
+		firstColColor: Type.Optional(Type.String({ description: "First column text color." })),
+		headerBorder: Type.Optional(Type.String({ description: "Separate border color for the header row." })),
+		cellRuns: Type.Optional(
+			Type.Array(Type.Array(Type.Array(Type.Record(Type.String(), Type.Any()))), {
+				description: "Per-cell rich text: cellRuns[row][col] = [{t,bold,color}].",
+			}),
+		),
 		aligns: Type.Optional(Type.Array(Type.String(), { description: "Per-column alignment, cycling." })),
 		margin: Type.Optional(Type.Number({ description: "Horizontal cell padding in inches." })),
 		valign: Type.Optional(Type.Union([Type.Literal("top"), Type.Literal("middle"), Type.Literal("bottom")])),
@@ -752,6 +974,11 @@ const tableStyleTool = defineTool({
 		if (params.bodyBold != null) args.push(params.bodyBold ? "--body-bold" : "--no-body-bold");
 		if (params.colWidths?.length) args.push("--col-widths", params.colWidths.join(","));
 		if (params.rowHeight != null) args.push("--row-height", String(params.rowHeight));
+		if (params.headerHeight != null) args.push("--header-height", String(params.headerHeight));
+		if (params.firstColBold != null) args.push(params.firstColBold ? "--first-col-bold" : "--no-first-col-bold");
+		if (params.firstColColor) args.push("--first-col-color", params.firstColColor);
+		if (params.headerBorder) args.push("--header-border", params.headerBorder);
+		if (params.cellRuns) args.push("--cell-runs", JSON.stringify(params.cellRuns));
 		if (params.aligns?.length) args.push("--aligns", params.aligns.join(","));
 		if (params.margin != null) args.push("--margin", String(params.margin));
 		if (params.valign) args.push("--valign", params.valign);
@@ -796,10 +1023,12 @@ const applyTool = defineTool({
 
 Supported ops (op + fields):
 - set_text: slide, shape, text | paras
-- set_cell: slide, shape, row, col, text
-- add_text: slide, x, y, w, h?, text | paras, size, font, color, bold, align, valign, line_spacing, space_after, space_before, indent, hanging, bullet, bullet_color, fit
+- set_cell: slide, shape, row, col, text | cell_runs
+- add_text: slide, x, y, w, h?, text | paras, size, font, color, bold, align, valign, line_spacing, space_after, space_before, indent, hanging, bullet, bullet_color, letter_spacing, fit, name
+- add_shape: slide, kind, x, y, w, h?, radius, fill, line, line_width, shadow, text | paras, size, color, name
 - add_image: slide, path, x, y, w, h
-- add_table: slide, rows, cols, x, y, w, h, data, size, header, theme_style, header_fill, header_color, zebra, border, col_widths, row_height, aligns
+- set_shape: slide, shape, x?, y?, w?, h?, fill?, line?, line_width?, rotation?, z?, name?
+- add_table: slide, rows, cols, x, y, w, h, data, size, header, theme_style, header_fill, header_color, zebra, border, header_border, col_widths, row_height, header_height, first_col_bold, first_col_color, cell_runs, aligns, name
 - delete_shape: slide, shape
 - set_notes: slide, text
 - table_style: slide, shape + ppt_table_style fields (snake_case)
@@ -822,7 +1051,9 @@ Behavior:
 				description: "Overflow mode for the auto-shot. Default loose.",
 			}),
 		),
-		ignore: Type.Optional(Type.Array(Type.String(), { description: "Shape names to skip in auto-shot checks." })),
+		ignore: Type.Optional(
+			Type.Array(Type.String(), { description: "Shapes to skip in auto-shot checks: name, '#<id>' or '/regex/'." }),
+		),
 		out: OUT,
 	}),
 	annotations: { readOnlyHint: false, destructiveHint: false, openWorldHint: false },
@@ -865,15 +1096,16 @@ const PPT_INTENT =
 	/(pptx?|powerpoint|slide|deck|presentation|幻灯片|演示文稿|汇报|简报|课件|画册)/i;
 
 const WORKFLOW = `The pi-pptx tools (ppt_*) author PowerPoint decks from existing templates. Follow this loop:
-1. ppt_inspect the source deck: layouts and sample slides. Use mode="summary" for a large deck, then full inspect (with slides="...") only on pages you will edit. Shapes have an id: address them as shape="#<id>" when names are duplicated.
-2. ppt_shot 1-4 sample pages (or montage=3 for an overview) and actually look at them; pick the page whose style matches each needed layout.
+0. ppt_doctor first, on the template: it lists font substitutions (rendering != PowerPoint, widths differ ~5%), so you can leave line-length margin from the start.
+1. ppt_inspect the source deck: layouts (including the shapes a layout draws itself, marked inherited) and sample slides. Use mode="summary" for a large deck, then full inspect (with slides="...") only on pages you will edit. Shapes have an id: address them as shape="#<id>" when names are duplicated.
+2. ppt_shot 1-6 sample pages (or montage=3 for an overview) and actually look at them; pick the page whose style matches each needed layout. Proofread text at 100+ dpi on a single page — contact-sheet cells are too small for footnotes.
 3. ppt_create a working copy with template=<source deck>. Never edit the source template in place.
 4. Design that lives in the master/layout (logo, background) -> ppt_add_slide; design that lives in a single page (groups, pictures, charts, tables) -> ppt_clone that page. Delete unused placeholders with ppt_delete_shape (clearing text leaves a rendering bullet).
-5. Text: ppt_set_text keeps the template's font/size/color. Use paras=[{runs:[{t,bold,color,size}]}] for mixed emphasis. New boxes: ppt_add_text (omit h to auto-grow; set spaceAfter/indent/bullet/fit as needed). Its font= applies to CJK too.
-6. Tables: clone a page that has one when available (inspect summary has_table). Otherwise ppt_add_table (theme style off by default) + ppt_table_style. Notes: ppt_set_notes.
+5. Text: ppt_set_text keeps the template's font/size/color; a reused layout often puts its title low/large — move it with ppt_set_shape (z="front" for overlays); paras=[{runs:[{t,bold,color,size}]}] for mixed emphasis; letterSpacing for tracking. New boxes: ppt_add_text (omit h to auto-grow; spaceAfter/indent/bullet/fit as needed). Shapes that are not text (cards, accent bars, chevrons, arrows, dividers): ppt_add_shape with fill/line/radius, shadow off by default.
+6. Tables: clone a page that has one when available (inspect summary has_table). Otherwise ppt_add_table (theme style off by default) + ppt_table_style: header_height for a taller header, first_col_bold/color for row labels, cell_runs for per-cell rich text, border "none" to drop gridlines. Notes: ppt_set_notes, then ppt_notes_check after any slide deletion (notes silently shift one page).
 7. For a multi-page build or more than ~20 edits, use ppt_apply with an ops=[...] array (dryRun first). One transaction, one file write, per-op errors, and an automatic overflow/overlap summary of changed slides.
-8. ppt_shot after each batch and check overflow[], overlaps[], wrapping and font sizes; fix and re-shoot. Do not finish while warnings are unresolved.
-Numbers: slides and insert positions are 1-based; table row/col and shape index are 0-based. Canvas is 13.33x7.5 in unless ppt_inspect says otherwise. Undo = recreate the working copy from the template and re-run the batch. If ppt_shot fails, run ppt_doctor.`;
+8. ppt_shot after each batch with onlyChanged=true to re-render just the touched pages; check overflow[], overlaps[], wrapping and font sizes; fix and re-shoot. Stricter check: overflow="strict". A clean template must report zero flags — anything listed in suppressed[] was skipped by an anchor/container rule, not fixed.
+9. Numbers: slides and insert positions are 1-based; table row/col and shape index are 0-based. Canvas is 13.33x7.5 in unless ppt_inspect says otherwise. Undo = recreate the working copy from the template and re-run the batch. For scripted, re-runnable builds, the same op layer is importable: from pi_pptx import Deck.`;
 
 export default function (pi: ExtensionAPI) {
 	for (const tool of [
@@ -886,10 +1118,13 @@ export default function (pi: ExtensionAPI) {
 		setTextTool,
 		setCellTool,
 		addTextTool,
+		addShapeTool,
 		addImageTool,
 		addTableTool,
+		setShapeTool,
 		deleteShapeTool,
 		setNotesTool,
+		notesCheckTool,
 		tableStyleTool,
 		applyTool,
 		deleteTool,

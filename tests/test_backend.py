@@ -658,6 +658,261 @@ class PptkitTests(unittest.TestCase):
         flagged = [item["shape"] for item in shot["shots"][0].get("overflow", [])]
         self.assertNotIn(added["name"], flagged)
 
+    # ---------------------------------------------------------- P0-1 anchors
+    def test_template_page_is_clean_under_strict(self):
+        """A never-edited template must report zero flags (acceptance for P0-1)."""
+        template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
+        if not Path(template).exists():
+            self.skipTest("real template not available")
+        shot = kit("shot", template, "--slides", "1-3", "--dpi", "70", "--overflow", "strict")
+        for entry in shot["shots"]:
+            self.assertFalse(entry.get("overflow"), f"slide {entry['slide']} overflow: {entry.get('overflow')}")
+            self.assertFalse(entry.get("overlaps"), f"slide {entry['slide']} overlaps: {entry.get('overlaps')}")
+
+    def test_top_anchored_first_line_overflow_is_suppressed_with_reason(self):
+        deck = self.create()
+        added = kit(
+            "add-text", str(deck), "--slide", "1", "--text", "大字号标题", "--x", "1", "--y", "1",
+            "--w", "6", "--h", "1.2", "--size", "44",
+        )
+        shot = kit("shot", str(deck), "--slides", "1", "--dpi", "90", "--overflow", "strict")
+        entry = shot["shots"][0]
+        flagged = [item["shape"] for item in entry.get("overflow", [])]
+        self.assertNotIn(added["name"], flagged)
+        reasons = [
+            side["reason"]
+            for item in entry.get("suppressed", [])
+            if item["kind"] == "overflow" and item["shape"] == added["name"]
+            for side in item["sides"]
+        ]
+        self.assertIn("anchor=t", reasons)
+
+    def test_ignores_accept_id_and_regex(self):
+        deck = self.create()
+        first = kit("add-text", str(deck), "--slide", "1", "--text", "很长的文字" * 8,
+                    "--x", "1", "--y", "1", "--w", "3", "--h", "0.4", "--size", "20")
+        second = kit("add-text", str(deck), "--slide", "1", "--text", "另一段很长的文字" * 8,
+                     "--x", "1", "--y", "4", "--w", "3", "--h", "0.4", "--size", "20")
+        by_id = kit("shot", str(deck), "--slides", "1", "--dpi", "80", "--ignore", f"#{first['id']}")
+        names = [item["shape"] for entry in by_id["shots"] for item in entry.get("overflow", [])]
+        self.assertNotIn(first["name"], names)
+        self.assertIn(second["name"], names)
+
+        by_regex = kit("shot", str(deck), "--slides", "1", "--dpi", "80", "--ignore", "/^TextBox/")
+        self.assertFalse([e for e in by_regex["shots"] if e.get("overflow")])
+
+    # ---------------------------------------------------------- P0-3 shapes
+    def test_add_shape_draws_cards_bars_and_chevrons(self):
+        deck = self.create()
+        card = kit(
+            "add-shape", str(deck), "--slide", "1", "--kind", "roundrect",
+            "--x", "1", "--y", "1.5", "--w", "4", "--h", "1.5",
+            "--fill", "#F4F7FB", "--line", "#CAD9E8", "--radius", "0.06",
+            "--text", "卡片", "--size", "16", "--color", "#1F4E79", "--name", "Card 1",
+        )
+        self.assertEqual(card["name"], "Card 1")
+        self.assertEqual(card["paragraphs"], 1)
+        self.assertAlmostEqual(card["box_in"][3], 1.5, places=2)
+
+        bar = kit("add-shape", str(deck), "--slide", "1", "--kind", "bar",
+                  "--x", "1", "--y", "3.4", "--w", "4", "--fill", "#1F4E79", "--line", "none")
+        self.assertAlmostEqual(bar["box_in"][3], 0.06, places=2)
+
+        chevron = kit("add-shape", str(deck), "--slide", "1", "--kind", "chevron",
+                      "--x", "5.5", "--y", "1.5", "--w", "1.6", "--h", "0.9", "--fill", "#2E75B6")
+        self.assertEqual(chevron["kind"], "chevron")
+
+        rule = kit("add-shape", str(deck), "--slide", "1", "--kind", "line",
+                   "--x", "1", "--y", "5", "--w", "5", "--fill", "#CAD9E8")
+        self.assertEqual(rule["kind"], "line")
+
+        info = self.inspect(deck, "1")
+        shapes = {s["name"]: s for s in info["slides"][0]["shapes"]}
+        self.assertIn("Card 1", shapes)
+        # A drawn card has no inherited theme shadow.
+        from pptx import Presentation
+
+        prs = Presentation(str(deck))
+        card_shape = next(s for s in prs.slides[0].shapes if s.name == "Card 1")
+        self.assertFalse(card_shape.shadow.inherit)
+        self.assertEqual(card_shape.adjustments[0], round(0.06 / 1.5, 3))
+
+    def test_apply_supports_add_shape(self):
+        deck = self.create()
+        ops = [
+            {"op": "add_shape", "slide": 1, "kind": "roundrect", "x": 1, "y": 1, "w": 3, "h": 1,
+             "fill": "#F4F7FB", "name": "Card A", "text": "A"},
+            {"op": "add_shape", "slide": 1, "kind": "chevron", "x": 4.2, "y": 1, "w": 1, "h": 1},
+        ]
+        out = kit("apply", str(deck), "--ops", json.dumps(ops), "--no-shot")
+        self.assertTrue(out["ok"])
+        self.assertEqual([op["kind"] for op in out["ops"]], ["roundrect", "chevron"])
+        self.assertIn("Card A", [s["name"] for s in self.inspect(deck, "1")["slides"][0]["shapes"]])
+
+    def test_set_shape_moves_restyles_and_reorders(self):
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "叠在上层", "--x", "1", "--y", "1", "--w", "3", "--h", "1")
+        card = kit("add-shape", str(deck), "--slide", "1", "--kind", "rect",
+                   "--x", "1", "--y", "1", "--w", "4", "--h", "2", "--fill", "#F4F7FB")
+        out = kit(
+            "set-shape", str(deck), "--slide", "1", "--shape", f"#{card['id']}",
+            "--x", "2", "--y", "2.5", "--w", "5", "--h", "1.5",
+            "--fill", "#EAF1F8", "--line", "#CAD9E8", "--z", "front", "--name", "Panel 1",
+        )
+        self.assertEqual(out["name"], "Panel 1")
+        self.assertEqual(out["box_before"], [1.0, 1.0, 4.0, 2.0])
+        self.assertEqual(out["box_in"], [2.0, 2.5, 5.0, 1.5])
+
+        from pptx import Presentation
+        from pptx.oxml.ns import qn
+
+        prs = Presentation(str(deck))
+        shapes = list(prs.slides[0].shapes)
+        self.assertEqual(shapes[-1].name, "Panel 1")  # z=front
+        panel = shapes[-1]
+        self.assertIsNotNone(panel._element.find(qn("p:spPr")).find(qn("a:solidFill")))
+
+        back = kit("set-shape", str(deck), "--slide", "1", "--shape", "Panel 1", "--z", "back")
+        self.assertEqual(back["z"], "back")
+        prs = Presentation(str(deck))
+        drawing = [s.name for s in prs.slides[0].shapes]
+        self.assertEqual(drawing[0], "Panel 1")
+
+    # ---------------------------------------------------------- P1-5 tables
+    def test_table_header_height_first_column_and_rich_cells(self):
+        deck = self.create()
+        kit(
+            "add-table", str(deck), "--slide", "1", "--rows", "3", "--cols", "2",
+            "--x", "1", "--y", "1", "--w", "8", "--h", "2.5",
+            "--data", json.dumps([["指标", "数值"], ["LVEF", "58"], ["BNP", "120"]], ensure_ascii=False),
+            "--header-fill", "#1F4E79", "--header-color", "FFFFFF",
+            "--row-height", "0.7", "--header-height", "0.45",
+            "--first-col-bold", "--first-col-color", "#1F4E79",
+            "--border", "none",
+        )
+        from pptx import Presentation
+
+        prs = Presentation(str(deck))
+        table = next(s for s in prs.slides[0].shapes if s.has_table).table
+        self.assertAlmostEqual(table.rows[0].height.inches, 0.45, places=2)
+        self.assertAlmostEqual(table.rows[1].height.inches, 0.7, places=2)
+        self.assertTrue(table.cell(1, 0).text_frame.paragraphs[0].runs[0].font.bold)
+        self.assertFalse(table.cell(1, 1).text_frame.paragraphs[0].runs[0].font.bold)
+
+        rich = [[[{"t": "指标"}], [{"t": "数值"}]],
+                [[{"t": "LVEF", "bold": True}, {"t": "（%）", "color": "888888"}], [{"t": "58"}]],
+                [[{"t": "BNP"}], [{"t": "120"}]]]
+        styled = kit("table-style", str(deck), "--slide", "1", "--shape",
+                     f"#{next(s.shape_id for s in prs.slides[0].shapes if s.has_table)}",
+                     "--cell-runs", json.dumps(rich, ensure_ascii=False), "--header-height", "0.5")
+        self.assertTrue(styled["rich_cells"])
+        prs = Presentation(str(deck))
+        table = next(s for s in prs.slides[0].shapes if s.has_table).table
+        runs = table.cell(1, 0).text_frame.paragraphs[0].runs
+        self.assertEqual([run.text for run in runs], ["LVEF", "（%）"])
+        self.assertTrue(runs[0].font.bold)
+        self.assertAlmostEqual(table.rows[0].height.inches, 0.5, places=2)
+
+    # ---------------------------------------------------------- P1-6 layouts
+    def test_inspect_lists_layout_owned_shapes(self):
+        template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
+        if not Path(template).exists():
+            self.skipTest("real template not available")
+        info = kit("inspect", template, "--mode", "summary")
+        with_shapes = [layout for layout in info["layouts"] if layout.get("shapes")]
+        self.assertTrue(with_shapes, "at least one layout should expose inherited shapes")
+        first = with_shapes[0]
+        self.assertTrue(first.get("shapes_hint"))
+        for shape in first["shapes"]:
+            self.assertTrue(shape["inherited"])
+            self.assertIn("box_in", shape)
+
+    # ---------------------------------------------------------- P2-8 extras
+    def test_letter_spacing_and_names(self):
+        deck = self.create()
+        added = kit(
+            "add-text", str(deck), "--slide", "1", "--text", "字距测试", "--x", "1", "--y", "1",
+            "--size", "20", "--letter-spacing", "0.75", "--name", "Label 1",
+        )
+        self.assertEqual(added["name"], "Label 1")
+        from pptx import Presentation
+        from pptx.oxml.ns import qn
+
+        prs = Presentation(str(deck))
+        shape = next(s for s in prs.slides[0].shapes if s.name == "Label 1")
+        rPr = shape.text_frame.paragraphs[0].runs[0]._r.find(qn("a:rPr"))
+        self.assertEqual(rPr.get("spc"), "75")
+
+    def test_notes_check_and_delete_reports_note_shift(self):
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "第一页", "--x", "1", "--y", "1")
+        kit("clone", str(deck), "1", "--count", "1")
+        kit("set-notes", str(deck), "--slide", "1", "--text", "第一页的备注：讲开场")
+        kit("set-notes", str(deck), "--slide", "2", "--text", "第二页的备注：讲方法")
+        first = kit("notes-check", str(deck))
+        self.assertEqual([row["notes_len"] > 0 for row in first["notes"]], [True, True])
+        self.assertEqual(first["notes"][0]["first_20"], "第一页的备注：讲开场")
+
+        out = kit("delete", str(deck), "--slides", "1")
+        self.assertEqual(out["slide_count"], 1)
+        self.assertEqual(len(out["notes_after"]), 1)
+        self.assertEqual(out["notes_after"][0]["first_20"], "第二页的备注：讲方法")
+        self.assertIn("notes_hint", out)
+
+    def test_only_changed_renders_only_touched_pages(self):
+        deck = self.create()
+        kit("clone", str(deck), "1", "--count", "2")
+        # First call on an unknown deck renders everything it can.
+        first = kit("shot", str(deck), "--only-changed", "--dpi", "60")
+        self.assertEqual(first["shot_slides"], [1, 2, 3])
+        second = kit("shot", str(deck), "--only-changed", "--dpi", "60")
+        self.assertTrue(second["no_changes"])
+        self.assertEqual(second["shots"], [])
+        kit("add-text", str(deck), "--slide", "2", "--text", "改动", "--x", "1", "--y", "1")
+        third = kit("shot", str(deck), "--only-changed", "--dpi", "60")
+        self.assertEqual(third["shot_slides"], [2])
+
+    def test_shot_density_table(self):
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "第一行\n第二行", "--x", "1", "--y", "1",
+            "--w", "5", "--h", "1.2", "--size", "18")
+        shot = kit("shot", str(deck), "--slides", "1", "--dpi", "70", "--density")
+        row = shot["density"][0]
+        self.assertEqual(row["slide"], 1)
+        self.assertIn("first_line", row)
+        self.assertIn("lines", row)
+        self.assertIn("capacity", row)
+
+    def test_per_page_region(self):
+        deck = self.create()
+        kit("clone", str(deck), "1", "--count", "1")
+        spec = json.dumps({"2": [0.5, 0.5, 3, 2], "default": [0, 0, 13.333, 7.5]})
+        shot = kit("shot", str(deck), "--slides", "1,2", "--dpi", "80", "--region", spec, "--overflow", "off")
+        sizes = {entry["slide"]: entry["px"][0] for entry in shot["shots"]}
+        self.assertLess(sizes[2], sizes[1])
+
+    def test_importable_deck_library(self):
+        sys.path.insert(0, str(ROOT / "python"))
+        try:
+            from pi_pptx import Deck
+        finally:
+            sys.path.pop(0)
+
+        deck = Deck.create(str(self.tmp / "lib.pptx"))
+        deck.add_text(slide=1, text="库生成的标题", x=1, y=1, w=8, size=28)
+        deck.card(slide=1, x=1, y=2.4, w=4, h=1.5, text="卡片", size=16)
+        deck.bar(slide=1, x=1, y=2.3, w=4)
+        result = deck.apply([{"op": "add_shape", "slide": 1, "kind": "chevron", "x": 6, "y": 2.4, "w": 1.2, "h": 1.5}])
+        self.assertTrue(result["ok"])
+        deck.save()
+        info = deck.inspect(slides="1")
+        names = [s["name"] for s in info["slides"][0]["shapes"]]
+        self.assertIn("TextBox 3", names)
+        self.assertIn("Rounded Rectangle 4", names)
+        # The library and the CLI operate on the same file.
+        cli_info = self.inspect(self.tmp / "lib.pptx", "1")
+        self.assertIn("卡" + "片", [s.get("text") for s in cli_info["slides"][0]["shapes"]])
+
     def test_real_template_with_pictures(self):
         template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
         if not Path(template).exists():

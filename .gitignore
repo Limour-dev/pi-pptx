@@ -155,3 +155,7 @@ __pycache__/
 
 # Local issue drafts
 issue/
+
+# python packaging
+*.egg-info/
+build/

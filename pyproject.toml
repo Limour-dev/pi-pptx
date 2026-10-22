@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pi-pptx"
+version = "0.3.0"
+description = "PPTX authoring library behind the pi-pptx agent tools (inspect, clone, edit, render)"
+requires-python = ">=3.10"
+dependencies = ["python-pptx>=1.0", "pymupdf>=1.24"]
+license = { text = "GPL-3.0-only" }
+
+[project.scripts]
+pi-pptx = "pi_pptx.cli:main"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["pi_pptx"]

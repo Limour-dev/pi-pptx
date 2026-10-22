@@ -68,10 +68,13 @@ test("registers the pptx toolset and command", () => {
 		"ppt_set_text",
 		"ppt_set_cell",
 		"ppt_add_text",
+		"ppt_add_shape",
 		"ppt_add_image",
 		"ppt_add_table",
+		"ppt_set_shape",
 		"ppt_delete_shape",
 		"ppt_set_notes",
+		"ppt_notes_check",
 		"ppt_table_style",
 		"ppt_apply",
 		"ppt_delete",
@@ -257,6 +260,121 @@ test("delete_shape, set_notes and table_style tools expose ids and results", asy
 	assert.ok(!texts.includes("待删除"));
 	assert.ok(inspected.details.slides[0].shapes.some((shape: any) => shape.id === table.details.id));
 	assert.equal(inspected.details.slides[0].notes, "第一段\n第二段");
+});
+
+test("add_shape draws cards and chevrons with stable names", async () => {
+	const cwd = await tempDir();
+	const deck = "shapes.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+
+	const card = await call(
+		"ppt_add_shape",
+		{
+			path: deck,
+			slide: 1,
+			kind: "roundrect",
+			x: 1,
+			y: 1.5,
+			w: 4,
+			h: 1.4,
+			radius: 0.06,
+			fill: "#F4F7FB",
+			line: "#CAD9E8",
+			text: "卡片标题",
+			size: 16,
+			color: "#1F4E79",
+			name: "Card 1",
+		},
+		cwd,
+	);
+	assert.equal(card.details.kind, "roundrect");
+	assert.equal(card.details.name, "Card 1");
+	assert.match(card.content[0].text, /added roundrect "Card 1"/);
+
+	const chevron = await call(
+		"ppt_add_shape",
+		{ path: deck, slide: 1, kind: "chevron", x: 5.5, y: 1.5, w: 1.4, h: 0.9, fill: "#2E75B6" },
+		cwd,
+	);
+	assert.equal(chevron.details.kind, "chevron");
+
+	const bar = await call("ppt_add_shape", { path: deck, slide: 1, kind: "bar", x: 1, y: 1.4, w: 4 }, cwd);
+	assert.ok(Math.abs(bar.details.box_in[3] - 0.06) < 0.01);
+
+	const inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	const names = inspected.details.slides[0].shapes.map((shape: any) => shape.name);
+	assert.ok(names.includes("Card 1"));
+
+	// Shapes are addressable by id afterwards (e.g. for ignore= or deletion).
+	const deleted = await call("ppt_delete_shape", { path: deck, slide: 1, shape: `#${chevron.details.id}` }, cwd);
+	assert.equal(deleted.details.deleted, true);
+});
+
+test("shot supports onlyChanged, density and id/regex ignore", async () => {
+	const cwd = await tempDir();
+	const deck = "incremental.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	await call("ppt_clone", { path: deck, source: 1, count: 2 }, cwd);
+
+	const first = await call("ppt_shot", { path: deck, slides: "1-3", dpi: 60, onlyChanged: true }, cwd);
+	assert.deepEqual(first.details.slides.map((slide: any) => slide.slide), [1, 2, 3]);
+
+	const second = await call("ppt_shot", { path: deck, dpi: 60, onlyChanged: true }, cwd);
+	assert.deepEqual(second.details.slides, []);
+	assert.match(second.content[0].text, /没有(任何)?页面变化|no_changes/);
+
+	const longText = "这一段文字足够长以制造确定的溢出效果。".repeat(6);
+	const flagged = await call(
+		"ppt_add_text",
+		{ path: deck, slide: 2, text: longText, x: 1, y: 1, w: 3, h: 0.4, size: 20, name: "Dense 1" },
+		cwd,
+	);
+	const third = await call("ppt_shot", { path: deck, dpi: 60, onlyChanged: true, density: true }, cwd);
+	assert.deepEqual(third.details.slides.map((slide: any) => slide.slide), [2]);
+	assert.ok(third.details.density[0].capacity >= 1);
+
+	const ignored = await call(
+		"ppt_shot",
+		{ path: deck, slides: "2", dpi: 60, overflow: "strict", ignore: [`#${flagged.details.id}`], density: true },
+		cwd,
+	);
+	const overflowNames = (ignored.details.slides[0].overflow ?? []).map((item: any) => item.shape);
+	assert.ok(!overflowNames.includes("Dense 1"));
+	const stillFlagged = await call("ppt_shot", { path: deck, slides: "2", dpi: 60, overflow: "strict" }, cwd);
+	assert.ok((stillFlagged.details.slides[0].overflow ?? []).length > 0);
+});
+
+test("set_shape moves a placeholder and changes z-order", async () => {
+	const cwd = await tempDir();
+	const deck = "layout.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	const added = await call(
+		"ppt_add_text",
+		{ path: deck, slide: 1, text: "底层图形", x: 1, y: 1, w: 3, h: 1, name: "Base 1" },
+		cwd,
+	);
+	const moved = await call(
+		"ppt_set_shape",
+		{ path: deck, slide: 1, shape: `#${added.details.id}`, x: 2, y: 2, w: 5, h: 1.2, z: "front", name: "Moved 1" },
+		cwd,
+	);
+	assert.deepEqual(moved.details.box_in, [2, 2, 5, 1.2]);
+	assert.equal(moved.details.name, "Moved 1");
+	assert.match(moved.content[0].text, /box \[/);
+});
+
+test("notes_check reports per-slide fingerprints", async () => {
+	const cwd = await tempDir();
+	const deck = "notes.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	await call("ppt_clone", { path: deck, source: 1, count: 1 }, cwd);
+	await call("ppt_set_notes", { path: deck, slide: 1, text: "第一页备注：开场" }, cwd);
+	await call("ppt_set_notes", { path: deck, slide: 2, text: "第二页备注：方法" }, cwd);
+
+	const checked = await call("ppt_notes_check", { path: deck }, cwd);
+	assert.equal(checked.details.notes.length, 2);
+	assert.equal(checked.details.notes[0].first_20, "第一页备注：开场");
+	assert.ok(checked.details.notes.every((row: any) => row.notes_len > 0));
 });
 
 test("shot montage returns one contact sheet", async () => {
