@@ -147,7 +147,11 @@ vite.config.ts.timestamp-*
 
 # Turbo Repo
 .turbo
+
 # Python
 __pycache__/
 *.py[cod]
 .pytest_cache/
+
+# Local issue drafts
+issue/
