@@ -8,6 +8,7 @@
 | 渲染 | LibreOffice headless → PDF → PyMuPDF | 任意页出 PNG/拼图/裁剪；文本溢出、形状重叠、逐形状密度、版本像素对比；PDF/PNG 缓存 |
 | 插件 | pi extension `defineTool` | **4 个工具**：`ppt_run_deck` / `ppt_inspect` / `ppt_shot` / `ppt_doctor`；截图以 `ImageContent` 直接回给模型 |
 | 库 | `python/pi_pptx/` | 与工具层同一套原语：`from pi_pptx import Deck`，脚本即事务 |
+| 规则 | `skills/`（pi skills） | 启动时注册、系统提示词里只放名字+描述+绝对路径，任务匹配时才读全文；会话中途不改提示词 |
 
 这套工具面来自一次真实产出（22 页、536 个形状、15 轮返工、1054 行 `build_deck.py`）：全程只用了 `ppt_inspect`（3 次）和 `ppt_shot`（14 次），编辑类工具**一次都没用**——因为整本是从零排的版，"改"+ 动作的循环是"改脚本 → 重跑 → 看图"。于是编辑 API 留成库，工具层只留"跑"和"看"。
 
@@ -132,23 +133,20 @@ ppt_run_deck({
 
 `box_in` 一律是英寸，原点在画布左上；默认画布 13.33 × 7.5 in（16:9）。组合内子形状的 `box_in` 已换算到画布坐标。**所有 `h` 都要自己按"字号 × 行数 × 1.35 + 0.25"估**——卡片不会自动长高，`add_table` 也不会自动适应。
 
-## Agent 工作流
+## Agent 工作流（技能）
 
-插件在检测到 PPT 类请求时（prompt 含 ppt/pptx/slides/幻灯片/演示文稿/模板等关键词）注入 `pptx_workflow`：
+规则和示例不在系统提示词里，而是 `skills/` 下的三个技能。插件启动时把该目录注册给 pi（`resources_discover`），
+系统提示词里只有每个技能的名字、一句话描述和**绝对路径**（由插件位置推导：开发目录、本地安装、npm 包都一样），
+模型在任务匹配时才去读全文。所以提示词从第一轮起就是稳定的，不会因为中途换话题而增删段落。
 
-```
-deck 的唯一真源是 report/<date>/build_deck.py。不要手动改 pptx，改脚本再 ppt_run_deck。
-0. ppt_doctor / ppt_inspect 先拿字体替换与画布尺寸，行宽留 5–10% 余量。
-1. ppt_inspect mode="summary" 看模板：几个 layout、样例页有什么、有没有表格样例。
-2. 写 build_deck.py：常量（CX/CW/每格高）+ 9 个语义包装（tx/card/bar/title/kicker/table/pic/bullets/notes），
-   裸 D.op() 只留给边角；每页一个小节，编号与页号一致；text_fit 是"能不能放下"的预检。
-3. 表格高度自己算：h = header_h + row_h × (rows-1)，包装器返回底边给下一块用。
-4. ppt_run_deck(shot="flagged") 迭代；干净了再 shot="changed" 或 all 全量看一遍。
-5. 数字：slides 1 起；row/col 与 shape index 0 起；画布 13.33×7.5 in。
-   撤销 = 重跑脚本。"改了 A 有没有挤坏 B" → ppt_shot compareTo=<上一版>。
-6. 复用模板已有设计（版式自带的 logo/分隔线/底纹不必重画）；20+ 卡片用数据列表批量生成。
-7. 脚本超过 ~300 行就把文案抽成常量表（22 页的 deck 有 60% 是文案）。
-```
+| 技能 | 什么时候读 |
+|---|---|
+| `pptx-deck-build` | 任何 PPT 任务的第一步：脚本骨架、`ppt_run_deck` 注入环境、`@@PAGE@@`/`@@DECK@@`/`@@WARN@@` 协议、模板克隆、坐标约定；`references/deck-api.md` 是 op 参数速查 |
+| `pptx-layout-design` | 定几何常量、字号、表格/卡片高度、页面节奏、中文行宽余量 |
+| `pptx-visual-review` | `ppt_inspect`/`ppt_shot` 验收：`text_fit` 预检、溢出/重叠怎么判、`density`/`compareTo`/`expect=clean` |
+
+也可以 `/skill:pptx-deck-build` 直接加载。三条硬规则写在 `pptx-deck-build` 里：deck 的真源是
+`build_deck.py`、改脚本再重跑（重跑即 undo）、不要逐个形状编辑。
 
 ## build_deck.py 骨架
 
@@ -297,7 +295,7 @@ print(deck.shots(only_changed=True)["shot_slides"])
 | `inspect` 补 `text_lines`/`box_in` 一致性 | 每个文本形状 `text_fit`（`est_lines`/`capacity_lines`/`needed_in`/`slack_in`/`fits`），排版前就能查 | `test_inspect_text_fit_and_text_mode` |
 | `inspect mode="text"` | 纯 `{shape,id,text}` 扁平表，用于校对成品术语/错别字 | 同上 |
 | `ppt_doctor` 字体信息前置 | `ppt_inspect` 也返回 `font_substitutions`；`ppt_doctor(path=)` 读主题字体 | 同上 |
-| 文档纪律替换 | `pptx_workflow` 改成"脚本是唯一真源"的 8 条 | 扩展测试 `injects the pptx workflow…` |
+| 文档纪律从提示词移到技能 | `pptx_workflow` 的 8 条规则拆成 `skills/` 下三个技能，启动时注册、按需读取；不再按关键词改系统提示词 | 扩展测试 `advertises the bundled skills once at startup…` |
 
 ## 开发与测试
 
@@ -310,13 +308,13 @@ npm run test:extension    # 仅扩展（stub pi API，无需模型）
 
 `tests/test_backend.py` 在临时目录自建合成模板（含图片/表格/备注），覆盖克隆保真、样式保留、单元格修改、中文字体 XML、批量事务/回滚、表格样式、备注、拼图/裁剪、溢出与重叠检测、缓存；以及本轮验收点：模板 `strict` 0 告警、顶锚点模板 leading 不报、overflow 的实测行高、`area_in2` 单位、`text_fit`/`mode=text`、逐形状密度、`expect=clean`、`compare_to`、`Deck.report()`。设置 `PI_PPTX_TEST_TEMPLATE` 后会额外验证真实模板。
 
-`tests/extension.test.ts` 用 stub 的 `ExtensionAPI` 加载真实扩展，直接调用 `tool.execute()`，验证：只注册 4 个工具、`ppt_run_deck` 注入环境并跑通真实脚本（脚本里没有 `sys.path`）、`@@DECK@@` 与 `inspect` 兜底、失败时的结构化 traceback + `stale`、`shot=flagged` 只渲报红页、`text_fit`/`mode=text`、`density`+`expect`+`compareTo`，以及工作流的条件注入。
+`tests/extension.test.ts` 用 stub 的 `ExtensionAPI` 加载真实扩展，直接调用 `tool.execute()`，验证：只注册 4 个工具、`ppt_run_deck` 注入环境并跑通真实脚本（脚本里没有 `sys.path`）、`@@DECK@@` 与 `inspect` 兜底、失败时的结构化 traceback + `stale`、`shot=flagged` 只渲报红页、`text_fit`/`mode=text`、`density`+`expect`+`compareTo`，以及技能目录在启动时按插件位置注册、会话中途不改系统提示词。
 
 ## 目录
 
 ```
 pi-pptx/
-├── extensions/pi-pptx.ts    # pi 工具层（4 个工具 + 工作流提示）
+├── extensions/pi-pptx.ts    # pi 工具层（4 个工具 + 启动时注册技能目录）
 ├── python/pptkit.py         # CLI 入口（薄壳）
 ├── python/pi_pptx/
 │   ├── __init__.py          # 可 import 的 Deck API（含 report()）
@@ -331,8 +329,9 @@ pi-pptx/
 │   └── cli.py               # argparse 子命令 + main()
 ├── examples/build_deck.py   # 推荐的 build_deck.py 骨架（4 页、语义包装、表格返回底边）
 ├── examples/cards_demo.py   # 只用库原语重建「5 卡片 + 4 chevron」页
+├── skills/                  # 渐进式载入的规则与示例（pptx-deck-build / pptx-layout-design / pptx-visual-review）
 ├── tests/                   # 后端 + 扩展测试
-├── package.json             # pi 包清单（pi.extensions）
+├── package.json             # pi 包清单（pi.extensions + pi.skills）
 ├── pyproject.toml           # pip install -e .（from pi_pptx import Deck）
 └── tsconfig.json
 ```

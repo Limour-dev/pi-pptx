@@ -12,6 +12,11 @@
  * rebuilt from the template in seconds, the script *is* the transaction, and a
  * Python loop beats 500 JSON ops. The op layer stays importable in
  * `../python/pi_pptx` (`from pi_pptx import Deck`).
+ *
+ * The rules and examples are NOT in the system prompt. They live in `../skills`
+ * and are registered once at startup, so Pi only advertises each skill's name,
+ * description and absolute path; the full text is read when a task matches.
+ * Nothing is injected or swapped while a session runs.
  */
 import { execFile } from "node:child_process";
 import { copyFile, mkdir, readFile, readdir, stat, unlink } from "node:fs/promises";
@@ -30,6 +35,9 @@ const PYTHON = process.env.PI_PPTKIT_PYTHON || "python3";
 // Resolved from this file, never from the development checkout: the plugin is
 // published as an npm package and `python/` ships next to `extensions/`.
 const PYTHON_DIR = fileURLToPath(new URL("../python", import.meta.url));
+// Skills carry the rules and examples, and are advertised by path. Resolved the
+// same way as python/: dev checkout, local install and npm package all work.
+const SKILLS_DIR = fileURLToPath(new URL("../skills", import.meta.url));
 const KIT = process.env.PI_PPTKIT_PY || path.join(PYTHON_DIR, "pptkit.py");
 
 const MAX_SHOT_PAGES = 6;
@@ -724,35 +732,17 @@ Failure handling: exit code, error type/message/file/line, \`traceback_tail\` (l
 	},
 });
 
-// ------------------------------------------------------------- prompt + cmd
-
-const PPT_INTENT =
-	/(pptx?|powerpoint|slide|deck|presentation|幻灯片|演示文稿|汇报|简报|课件|画册)/i;
-
-const WORKFLOW = `The pi-pptx tools run a deck BUILD SCRIPT and let you see the result. The deck's only source of truth is the script (e.g. report/<date>/build_deck.py): never edit the pptx, edit the script and run it again.
-0. ppt_doctor (or ppt_inspect) first: font substitutions are a layout parameter (a substituted face is ~5% wider), so leave 5-10% line-width margin from the start.
-1. ppt_inspect mode="summary" the template: how many layouts, what the sample pages hold, whether there is a table sample. mode="text" later for proofreading the finished deck.
-2. Write build_deck.py: Deck.create(OUT, template=TPL, overwrite=True) then draw page by page. Put geometry constants (CX/CW/cell height) at the top, wrap ~95% of shapes in 9 semantic helpers (tx/card/bar/title/kicker/table/pic/bullets/notes) and leave raw D.op() for the corners. One section per page, numbered like the slide. text_fit (from ppt_inspect) is the pre-flight check for "does this text fit".
-3. Table height is computed by you: h = header_h + row_h * (rows-1); return the bottom edge from the helper so the next block starts below it.
-4. ppt_run_deck(shot="flagged") while iterating — only the pages that reported @@WARN@@ are rendered. When it is clean, ppt_run_deck(shot="changed") or ppt_shot for a full look.
-5. Numbers: slides are 1-based; row/col and shape index are 0-based; canvas is 13.33x7.5 in. Undo = run the script again (Deck.create(overwrite=True) is idempotent). "Did my fix break another page?" -> ppt_shot compareTo=<previous pptx>.
-6. Reuse the template's design instead of redrawing it: what the layout already draws (logo, rules, background) needs no shape. If a page has 20+ cards, generate them from a data list, not by hand.
-7. Keep the script under ~300 lines by moving copy into a constant table; at 22 pages the text is 60% of the file.`;
-
+// ------------------------------------------------------------- skills + cmd
 export default function (pi: ExtensionAPI) {
 	for (const tool of [inspectTool, shotTool, doctorTool, runDeckTool]) {
 		pi.registerTool(tool);
 	}
 
-	// Only pay the prompt tokens when the run looks like PowerPoint work.
-	pi.on("before_agent_start", async (event) => {
-		if (event.messageType !== "user") return;
-		if (!PPT_INTENT.test(event.prompt)) return;
-		event.systemPromptOptions.sections = {
-			...event.systemPromptOptions.sections,
-			pptx_workflow: WORKFLOW,
-		};
-	});
+	// Skills, not a mid-session prompt swap: the deck rules and examples are
+	// discovered once at startup, advertised by their own absolute path, and read
+	// only when the task matches. Enabling this plugin already means PPT work, so
+	// no prompt sniffing is needed.
+	pi.on("resources_discover", () => ({ skillPaths: [SKILLS_DIR] }));
 
 	pi.registerCommand("pptx", {
 		description: "Check the pptx backend (python-pptx, PyMuPDF, LibreOffice, fonts)",

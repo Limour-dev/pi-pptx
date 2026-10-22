@@ -15,6 +15,7 @@
 		"extensions",
 		"python",
 		"examples",
+		"skills",
 		"pyproject.toml",
 		"README.md",
 		"LICENSE"
@@ -22,6 +23,9 @@
 	"pi": {
 		"extensions": [
 			"./extensions/pi-pptx.ts"
+		],
+		"skills": [
+			"./skills"
 		]
 	},
 	"scripts": {

@@ -5,10 +5,11 @@
  * Run: node --test tests/extension.test.ts   (Node 22.18+/26 strips types)
  */
 import assert from "node:assert/strict";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
+import { fileURLToPath } from "node:url";
 
 import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 
@@ -81,7 +82,10 @@ test("registers only the run/inspect/shot/doctor toolset", () => {
 		assert.equal(tools.has(gone), false, `${gone} must not be registered`);
 	}
 	assert.deepEqual(commands, ["pptx"]);
-	assert.ok(events.some((event) => event.name === "before_agent_start"));
+	assert.ok(events.some((event) => event.name === "resources_discover"));
+	// No per-run system prompt mutation: the rules live in skills/, advertised once
+	// at startup, so the prompt is fixed from the first turn.
+	assert.equal(events.some((event) => event.name === "before_agent_start"), false);
 	assert.equal(tools.get("ppt_shot")!.annotations?.readOnlyHint, true);
 	assert.equal(tools.get("ppt_run_deck")!.annotations?.readOnlyHint, false);
 });
@@ -322,26 +326,29 @@ D.report()
 	assert.deepEqual(same.details.shot.changed_vs_previous, []);
 });
 
-test("injects the pptx workflow only for PowerPoint prompts", async () => {
-	const handler = events.find((event) => event.name === "before_agent_start")!.handler;
+test("advertises the bundled skills once at startup instead of rewriting the prompt", async () => {
+	const handler = events.find((event) => event.name === "resources_discover")!.handler;
+	const result = await handler({ type: "resources_discover", cwd: process.cwd(), reason: "startup" });
 
-	const pptEvent = {
-		type: "before_agent_start",
-		messageType: "user",
-		prompt: "用这个模板做一份 PPT",
-		systemPromptOptions: { sections: {} as Record<string, string> },
-	};
-	await handler(pptEvent);
-	const workflow = pptEvent.systemPromptOptions.sections.pptx_workflow;
-	assert.match(workflow, /ppt_run_deck/);
-	assert.match(workflow, /build_deck\.py/);
+	assert.equal(result?.skillPaths?.length, 1);
+	const skillsDir = result.skillPaths[0];
+	// Path comes from the extension's own location, so it works from a checkout, a
+	// local install and an npm package.
+	assert.ok(path.isAbsolute(skillsDir), `${skillsDir} must be absolute`);
+	assert.equal(path.dirname(skillsDir), path.resolve(path.dirname(fileURLToPath(import.meta.url)), ".."));
 
-	const chatEvent = {
-		type: "before_agent_start",
-		messageType: "user",
-		prompt: "explain this TypeScript function",
-		systemPromptOptions: { sections: {} as Record<string, string> },
-	};
-	await handler(chatEvent);
-	assert.equal(chatEvent.systemPromptOptions.sections.pptx_workflow, undefined);
+	const dirs = (await readdir(skillsDir, { withFileTypes: true })).filter((entry) => entry.isDirectory());
+	assert.ok(dirs.length >= 3, "deck-build / layout-design / visual-review skills ship with the plugin");
+
+	const build = await readFile(path.join(skillsDir, "pptx-deck-build", "SKILL.md"), "utf8");
+	assert.match(build, /^---\nname: pptx-deck-build\ndescription: .+\n---\n/);
+	assert.match(build, /ppt_run_deck/);
+	assert.match(build, /build_deck\.py/);
+	// The skill points at the runnable example, which must exist next to the skills.
+	await stat(path.join(skillsDir, "..", "examples", "build_deck.py"));
+
+	for (const name of ["pptx-layout-design", "pptx-visual-review"]) {
+		const text = await readFile(path.join(skillsDir, name, "SKILL.md"), "utf8");
+		assert.match(text, new RegExp(`^---\\nname: ${name}\\ndescription: .+\\n---\\n`));
+	}
 });
