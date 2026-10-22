@@ -1,0 +1,41 @@
+{
+	"name": "pi-pptx",
+	"version": "0.1.0",
+	"description": "Author PowerPoint decks from existing templates in pi: inspect, clone, edit, render and visually self-check slides.",
+	"type": "module",
+	"license": "GPL-3.0-only",
+	"keywords": [
+		"pi-package",
+		"pi-extension",
+		"pptx",
+		"powerpoint",
+		"slides"
+	],
+	"files": [
+		"extensions",
+		"python",
+		"README.md",
+		"LICENSE"
+	],
+	"pi": {
+		"extensions": [
+			"./extensions/pi-pptx.ts"
+		]
+	},
+	"scripts": {
+		"typecheck": "tsc --noEmit",
+		"test": "bash tests/smoke.sh",
+		"test:backend": "python3 tests/test_backend.py",
+		"test:extension": "node --test tests/extension.test.ts"
+	},
+	"peerDependencies": {
+		"@earendil-works/pi-ai": "*",
+		"@earendil-works/pi-coding-agent": "*"
+	},
+	"devDependencies": {
+		"@earendil-works/pi-ai": "1.2.0",
+		"@earendil-works/pi-coding-agent": "1.2.0",
+		"@types/node": "^22.19.0",
+		"typescript": "^5.9.3"
+	}
+}
