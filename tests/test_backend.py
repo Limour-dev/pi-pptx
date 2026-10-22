@@ -10,7 +10,6 @@ import base64
 import hashlib
 import json
 import os
-import re
 import subprocess
 import sys
 import tempfile
@@ -661,15 +660,16 @@ class PptkitTests(unittest.TestCase):
     # ---------------------------------------------------------- P0-1 anchors
     def test_template_page_is_clean_under_strict(self):
         """A never-edited template must report zero flags (acceptance for P0-1)."""
-        template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
-        if not Path(template).exists():
-            self.skipTest("real template not available")
+        template = os.environ.get("PI_PPTX_TEST_TEMPLATE", "")
+        if not template or not Path(template).exists():
+            self.skipTest("set PI_PPTX_TEST_TEMPLATE to a real deck to run this")
         shot = kit("shot", template, "--slides", "1-3", "--dpi", "70", "--overflow", "strict")
         for entry in shot["shots"]:
             self.assertFalse(entry.get("overflow"), f"slide {entry['slide']} overflow: {entry.get('overflow')}")
             self.assertFalse(entry.get("overlaps"), f"slide {entry['slide']} overlaps: {entry.get('overlaps')}")
 
-    def test_top_anchored_first_line_overflow_is_suppressed_with_reason(self):
+    def test_template_title_leading_is_not_reported(self):
+        """A top-anchored spill under 5pt is template leading, on every page."""
         deck = self.create()
         added = kit(
             "add-text", str(deck), "--slide", "1", "--text", "大字号标题", "--x", "1", "--y", "1",
@@ -679,13 +679,12 @@ class PptkitTests(unittest.TestCase):
         entry = shot["shots"][0]
         flagged = [item["shape"] for item in entry.get("overflow", [])]
         self.assertNotIn(added["name"], flagged)
-        reasons = [
-            side["reason"]
-            for item in entry.get("suppressed", [])
-            if item["kind"] == "overflow" and item["shape"] == added["name"]
-            for side in item["sides"]
+        # Not merely "suppressed": the noise is dropped, not moved to another list.
+        noisy = [
+            item for item in entry.get("suppressed", [])
+            if item["shape"] == added["name"]
         ]
-        self.assertIn("anchor=t", reasons)
+        self.assertFalse(noisy)
 
     def test_ignores_accept_id_and_regex(self):
         deck = self.create()
@@ -815,9 +814,9 @@ class PptkitTests(unittest.TestCase):
 
     # ---------------------------------------------------------- P1-6 layouts
     def test_inspect_lists_layout_owned_shapes(self):
-        template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
-        if not Path(template).exists():
-            self.skipTest("real template not available")
+        template = os.environ.get("PI_PPTX_TEST_TEMPLATE", "")
+        if not template or not Path(template).exists():
+            self.skipTest("set PI_PPTX_TEST_TEMPLATE to a real deck to run this")
         info = kit("inspect", template, "--mode", "summary")
         with_shapes = [layout for layout in info["layouts"] if layout.get("shapes")]
         self.assertTrue(with_shapes, "at least one layout should expose inherited shapes")
@@ -874,14 +873,112 @@ class PptkitTests(unittest.TestCase):
 
     def test_shot_density_table(self):
         deck = self.create()
-        kit("add-text", str(deck), "--slide", "1", "--text", "第一行\n第二行", "--x", "1", "--y", "1",
-            "--w", "5", "--h", "1.2", "--size", "18")
+        added = kit("add-text", str(deck), "--slide", "1", "--text", "第一行\n第二行", "--x", "1", "--y", "1",
+                    "--w", "5", "--h", "1.2", "--size", "18")
         shot = kit("shot", str(deck), "--slides", "1", "--dpi", "70", "--density")
         row = shot["density"][0]
         self.assertEqual(row["slide"], 1)
         self.assertIn("first_line", row)
         self.assertIn("lines", row)
-        self.assertIn("capacity", row)
+        # Density is per shape: text that does not fit is one box that is too
+        # short, so the row names it instead of averaging the whole page.
+        self.assertTrue(row["shapes"])
+        entry = next(item for item in row["shapes"] if item["shape"] == added["name"])
+        for key in ("shape", "rendered_lines", "needed_in", "box_h_in", "slack_in"):
+            self.assertIn(key, entry)
+        self.assertEqual(entry["rendered_lines"], 2)
+
+    def test_overflow_reports_measured_lines_and_height(self):
+        deck = self.create()
+        bad = kit(
+            "add-text", str(deck), "--slide", "1", "--text", "溢出文字" * 30,
+            "--x", "1", "--y", "1", "--w", "3", "--h", "0.4", "--size", "18",
+        )
+        shot = kit("shot", str(deck), "--slides", "1", "--dpi", "80", "--overflow", "strict")
+        entry = next(item for item in shot["shots"][0]["overflow"] if item["shape"] == bad["name"])
+        self.assertGreater(entry["rendered_lines"], 1)
+        self.assertGreater(entry["needed_in"], 0.4)
+        self.assertLess(entry["slack_in"], 0)
+
+    def test_overlap_area_is_square_inches(self):
+        """area_in2 used to mix points with inches (1e11 on a 100 in² canvas)."""
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "重叠一", "--x", "1", "--y", "2", "--w", "4", "--h", "1", "--size", "20")
+        kit("add-text", str(deck), "--slide", "1", "--text", "重叠二", "--x", "1.2", "--y", "2.1", "--w", "4", "--h", "1", "--size", "20")
+        shot = kit("shot", str(deck), "--slides", "1", "--dpi", "70", "--overflow", "off")
+        overlaps = shot["shots"][0]["overlaps"]
+        self.assertTrue(overlaps)
+        for item in overlaps:
+            self.assertLessEqual(item["area_in2"], 4 * 1.0 + 0.01)
+            self.assertLessEqual(item["ratio"], 1.0)
+            self.assertGreater(item["ratio"], 0.2)
+
+    def test_inspect_text_fit_and_text_mode(self):
+        deck = self.create()
+        tight = kit(
+            "add-text", str(deck), "--slide", "1", "--text", "两行文字需要的空间\n比这个盒子高" * 2,
+            "--x", "1", "--y", "1", "--w", "2", "--h", "0.3", "--size", "18",
+        )
+        info = kit("inspect", str(deck), "--slides", "1")
+        shapes = {shape["name"]: shape for shape in info["slides"][0]["shapes"]}
+        fit = shapes[tight["name"]]["text_fit"]
+        self.assertTrue(fit["estimated"])
+        self.assertFalse(fit["fits"])
+        self.assertGreater(fit["est_lines"], fit["capacity_lines"])
+        self.assertIn("font_substitutions", info)
+
+        text_mode = kit("inspect", str(deck), "--slides", "1", "--mode", "text")
+        self.assertEqual(text_mode["mode"], "text")
+        texts = [row["text"] for row in text_mode["slides"][0]["shapes"]]
+        self.assertTrue(any("两行文字" in text for text in texts))
+        self.assertNotIn("layouts", text_mode)
+
+    def test_shot_expect_clean_and_flagged_slides(self):
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "正常", "--x", "1", "--y", "1", "--w", "4", "--h", "1", "--size", "20")
+        quiet = kit("shot", str(deck), "--slides", "1", "--dpi", "70", "--expect", "clean")
+        self.assertTrue(quiet["clean"])
+        self.assertEqual(quiet["flagged_slides"], [])
+        self.assertNotIn("expectation_failed", quiet)
+
+        kit("add-text", str(deck), "--slide", "1", "--text", "溢出" * 40, "--x", "1", "--y", "3",
+            "--w", "3", "--h", "0.4", "--size", "18")
+        flagged = kit("shot", str(deck), "--slides", "1", "--dpi", "70", "--expect", "clean")
+        self.assertFalse(flagged["clean"])
+        self.assertTrue(flagged["expectation_failed"])
+        self.assertEqual(flagged["flagged_slides"], [1])
+
+    def test_shot_compare_to_reports_changed_pages(self):
+        deck = self.create()
+        kit("add-text", str(deck), "--slide", "1", "--text", "版本一", "--x", "1", "--y", "1", "--w", "5", "--h", "1", "--size", "24")
+        kit("clone", str(deck), "1", "--count", "1")
+        previous = self.tmp / "previous.pptx"
+        edited = kit(
+            "add-text", str(deck), "--slide", "2", "--text", "版本一", "--x", "1", "--y", "2",
+            "--w", "5", "--h", "1", "--size", "24",
+        )
+        previous.write_bytes(deck.read_bytes())
+        kit("set-text", str(deck), "--slide", "2", "--shape", f"#{edited['id']}", "--text", "版本二")
+        shot = kit("shot", str(deck), "--slides", "1,2", "--dpi", "60", "--compare-to", str(previous))
+        compared = {row["slide"]: row["changed_px_ratio"] for row in shot["compared"]}
+        self.assertEqual(compared[1], 0.0)
+        self.assertGreater(compared[2], 0.0)
+        self.assertEqual(shot["changed_vs_previous"], [2])
+
+    def test_deck_report_protocol(self):
+        sys.path.insert(0, str(ROOT / "python"))
+        try:
+            from pi_pptx import Deck
+
+            deck = Deck.create(str(self.tmp / "report.pptx"))
+            deck.add_text(slide=1, text="标题", x=1, y=1, w=5, size=24)
+            deck.save()
+            result = deck.report()
+        finally:
+            sys.path.pop(0)
+        self.assertEqual(result["slides"], 1)
+        self.assertEqual(result["shapes"], 3)
+        self.assertTrue(Path(result["out"]).exists())
 
     def test_per_page_region(self):
         deck = self.create()
@@ -914,9 +1011,9 @@ class PptkitTests(unittest.TestCase):
         self.assertIn("卡" + "片", [s.get("text") for s in cli_info["slides"][0]["shapes"]])
 
     def test_real_template_with_pictures(self):
-        template = os.environ.get("PI_PPTX_TEST_TEMPLATE") or "/home/limour/pi-test/PPT模板.pptx"
-        if not Path(template).exists():
-            self.skipTest("real template not available")
+        template = os.environ.get("PI_PPTX_TEST_TEMPLATE", "")
+        if not template or not Path(template).exists():
+            self.skipTest("set PI_PPTX_TEST_TEMPLATE to a real deck to run this")
         info = kit("inspect", template, "--slides", "1-3")
         self.assertEqual(len(info["slides"]), 3)
         deck = self.create("real.pptx", template=template)

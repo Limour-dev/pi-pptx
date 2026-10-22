@@ -5,7 +5,7 @@
  * Run: node --test tests/extension.test.ts   (Node 22.18+/26 strips types)
  */
 import assert from "node:assert/strict";
-import { mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { after, test } from "node:test";
@@ -53,352 +53,273 @@ async function call(name: string, params: Record<string, unknown>, cwd: string):
 	return tool!.execute("test-call", params, undefined, undefined, ctxFor(cwd));
 }
 
+/** Write a build script that only relies on the injected environment. */
+async function buildScript(cwd: string, name: string, body: string): Promise<string> {
+	const header = [
+		"#!/usr/bin/env python3",
+		"import os",
+		"from pathlib import Path",
+		"from pi_pptx import Deck  # PYTHONPATH is injected by ppt_run_deck",
+		"",
+		'OUT = Path(os.environ["DECK_OUT"])',
+		'ROOT = Path(os.environ["DECK_ROOT"])',
+		"",
+		"",
+	].join("\n");
+	await writeFile(path.join(cwd, name), `${header}${body.trimEnd()}\n`, "utf8");
+	return name;
+}
+
 after(async () => {
 	await Promise.all(dirs.map((dir) => rm(dir, { recursive: true, force: true })));
 });
 
-test("registers the pptx toolset and command", () => {
-	for (const name of [
-		"ppt_inspect",
-		"ppt_shot",
-		"ppt_doctor",
-		"ppt_create",
-		"ppt_clone",
-		"ppt_add_slide",
-		"ppt_set_text",
-		"ppt_set_cell",
-		"ppt_add_text",
-		"ppt_add_shape",
-		"ppt_add_image",
-		"ppt_add_table",
-		"ppt_set_shape",
-		"ppt_delete_shape",
-		"ppt_set_notes",
-		"ppt_notes_check",
-		"ppt_table_style",
-		"ppt_apply",
-		"ppt_delete",
-	]) {
-		assert.ok(tools.has(name), `${name} registered`);
+test("registers only the run/inspect/shot/doctor toolset", () => {
+	assert.deepEqual([...tools.keys()].sort(), ["ppt_doctor", "ppt_inspect", "ppt_run_deck", "ppt_shot"]);
+	// Editing a shape is a script call, not a tool: the deck is rebuilt instead.
+	for (const gone of ["ppt_apply", "ppt_set_text", "ppt_clone", "ppt_add_shape", "ppt_delete"]) {
+		assert.equal(tools.has(gone), false, `${gone} must not be registered`);
 	}
 	assert.deepEqual(commands, ["pptx"]);
 	assert.ok(events.some((event) => event.name === "before_agent_start"));
 	assert.equal(tools.get("ppt_shot")!.annotations?.readOnlyHint, true);
+	assert.equal(tools.get("ppt_run_deck")!.annotations?.readOnlyHint, false);
 });
 
-test("create -> edit -> shot returns images and overflow warnings", async () => {
+test("ppt_run_deck injects the backend path, shoots changed pages and reports the deck", async () => {
 	const cwd = await tempDir();
-	const deck = "deck.pptx";
+	const script = await buildScript(
+		cwd,
+		"build.py",
+		`
+D = Deck.create(OUT, overwrite=True)
+print("@@PAGE@@ 1", flush=True)
+D.add_text(slide=1, text="脚本生成的标题", x=1, y=1, w=8, h=1, size=28)
+D.save()
+D.report()
+`,
+	);
+	const result = await call("ppt_run_deck", { script, out: "out/deck.pptx", shot: "changed", dpi: 70 }, cwd);
+	assert.equal(result.details.ok, true);
+	assert.equal(result.details.exit_code, 0);
+	assert.equal(result.details.out, path.join(cwd, "out/deck.pptx"));
+	assert.equal(result.details.deck.slides, 1);
+	assert.ok(result.details.deck.shapes >= 1);
+	assert.deepEqual(result.details.changed_slides, [1]);
+	assert.match(result.content[0].text, /^OK ppt_run_deck build\.py/);
+	assert.match(result.content[0].text, /deck: 1 slides/);
+	// The auto-shot is part of the same call: one image, no second round trip.
+	const images = result.content.filter((block: any) => block.type === "image");
+	assert.equal(images.length, 1);
+	assert.equal(images[0].mimeType, "image/png");
+	assert.ok(images[0].data.length > 1000);
+});
 
-	const created = await call("ppt_create", { path: deck }, cwd);
-	assert.match(created.content[0].text, /1 slides/);
+test("ppt_run_deck returns a structured failure and keeps the previous output", async () => {
+	const cwd = await tempDir();
+	await buildScript(
+		cwd,
+		"ok.py",
+		`
+D = Deck.create(OUT, overwrite=True)
+D.add_text(slide=1, text="上一版", x=1, y=1, w=6, h=1, size=24)
+D.save()
+`,
+	);
+	const first = await call("ppt_run_deck", { script: "ok.py", out: "deck.pptx", shot: false }, cwd);
+	assert.equal(first.details.ok, true);
+	assert.ok(first.details.deck, "deck summary falls back to inspect when @@DECK@@ is missing");
 
-	await call(
-		"ppt_add_text",
-		{ path: deck, slide: 1, text: "正常标题", x: 1, y: 1, w: 6, h: 1, size: 24 },
+	const broken = await buildScript(
+		cwd,
+		"broken.py",
+		`
+print("第一页开始画")
+raise ValueError("unknown shape '内容占位符 6'")
+`,
+	);
+	const failed = await call("ppt_run_deck", { script: broken, out: "deck.pptx", shot: "changed" }, cwd);
+	assert.equal(failed.details.ok, false);
+	assert.equal(failed.details.stale, true);
+	assert.equal(failed.details.error.type, "ValueError");
+	assert.equal(failed.details.error.message, "unknown shape '内容占位符 6'");
+	assert.ok(String(failed.details.error.file).endsWith("broken.py"));
+	assert.ok(failed.details.error.line >= 10, "traceback line points into the body");
+	assert.equal(failed.details.shot.skipped, "build failed");
+	assert.match(failed.content[0].text, /^FAILED ppt_run_deck broken\.py/);
+	assert.match(failed.content[0].text, /ERROR ValueError/);
+	// The previous build is still on disk and still shot-able.
+	const shot = await call("ppt_shot", { path: "deck.pptx", slides: "1", dpi: 60 }, cwd);
+	assert.equal(shot.details.slides.length, 1);
+});
+
+test("ppt_run_deck shot=flagged renders only the pages from @@WARN@@", async () => {
+	const cwd = await tempDir();
+	const script = await buildScript(
+		cwd,
+		"three.py",
+		`
+D = Deck.create(OUT, empty=True)
+D.add_slide(0)
+D.add_slide(0)
+D.add_slide(0)
+D.add_text(slide=2, text="第二页", x=1, y=1, w=4, h=0.6, size=20)
+print("@@WARN@@ slide 2: bottom_pt 12.0", flush=True)
+D.save()
+D.report()
+`,
+	);
+	const flagged = await call(
+		"ppt_run_deck",
+		{ script, out: "deck.pptx", shot: "flagged", dpi: 60 },
 		cwd,
 	);
-	const longText = "这是一段特意写得很长很长的说明文字，用来制造确定性的文本溢出。".repeat(3);
-	const bad = await call(
-		"ppt_add_text",
-		{ path: deck, slide: 1, text: longText, x: 1, y: 2.5, w: 4, h: 0.3, size: 18 },
-		cwd,
-	);
-	const badName = bad.details.name as string;
+	assert.equal(flagged.details.ok, true);
+	assert.deepEqual(flagged.details.deck.slides, 3);
+	assert.deepEqual(flagged.details.shot.shots.map((shot: any) => shot.slide), [2]);
 
-	const inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	// No @@WARN@@ means no render at all — the fast iteration path.
+	const quiet = await buildScript(
+		cwd,
+		"quiet.py",
+		`
+D = Deck.create(OUT, overwrite=True)
+D.add_text(slide=1, text="干净的一页", x=1, y=1, w=6, h=1, size=24)
+D.save()
+D.report()
+`,
+	);
+	const skipped = await call("ppt_run_deck", { script: quiet, out: "deck.pptx", shot: "flagged" }, cwd);
+	assert.equal(skipped.details.ok, true);
+	assert.match(String(skipped.details.shot.skipped), /no @@WARN@@/);
+});
+
+test("ppt_inspect reports text_fit, font substitutions and a text mode", async () => {
+	const cwd = await tempDir();
+	const script = await buildScript(
+		cwd,
+		"build.py",
+		`
+D = Deck.create(OUT, overwrite=True)
+D.add_text(slide=1, text="这一行放不下" * 4, x=1, y=1, w=1.5, h=0.3, size=18)
+D.save()
+`,
+	);
+	await call("ppt_run_deck", { script, out: "deck.pptx", shot: false }, cwd);
+
+	const inspected = await call("ppt_inspect", { path: "deck.pptx", slides: "1" }, cwd);
 	assert.equal(inspected.details.slide_count, 1);
-	const shapePaths = inspected.details.slides[0].shapes.map((shape: any) => shape.path);
-	assert.ok(shapePaths.includes(badName));
+	const shape = inspected.details.slides[0].shapes.find((item: any) => item.text?.startsWith("这一行放不下"));
+	assert.ok(shape, "text shape is inspectable");
+	assert.equal(shape.text_fit.estimated, true);
+	assert.equal(shape.text_fit.fits, false);
+	assert.ok(shape.text_fit.est_lines > shape.text_fit.capacity_lines);
+	assert.ok(inspected.details.font_substitutions !== undefined);
 
-	const shot = await call("ppt_shot", { path: deck, slides: "1", dpi: 80 }, cwd);
-	assert.equal(shot.content[0].type, "text");
+	const textMode = await call("ppt_inspect", { path: "deck.pptx", slides: "1", mode: "text" }, cwd);
+	assert.equal(textMode.details.mode, "text");
+	assert.equal(textMode.details.layouts, undefined);
+	const texts = textMode.details.slides[0].shapes.map((row: any) => row.text);
+	assert.ok(texts.some((text: string) => text.startsWith("这一行放不下")));
+});
+
+test("ppt_shot exposes measured overflow, per-shape density and compareTo", async () => {
+	const cwd = await tempDir();
+	const script = await buildScript(
+		cwd,
+		"build.py",
+		`
+D = Deck.create(OUT, overwrite=True)
+D.add_text(slide=1, text="确定性的溢出文字" * 12, x=1, y=1, w=3, h=0.4, size=18)
+D.save()
+`,
+	);
+	await call("ppt_run_deck", { script, out: "deck.pptx", shot: false }, cwd);
+
+	const shot = await call(
+		"ppt_shot",
+		{ path: "deck.pptx", slides: "1", dpi: 60, density: true, expect: "clean", compareTo: "deck.pptx" },
+		cwd,
+	);
 	assert.match(shot.content[0].text, /WARNING text overflow/);
-	assert.match(shot.content[0].text, new RegExp(badName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+	assert.match(shot.content[0].text, /EXPECTATION FAILED/);
 	const image = shot.content.find((block: any) => block.type === "image");
 	assert.ok(image, "shot returns an image block");
 	assert.equal(image.mimeType, "image/png");
-	assert.ok(image.data.length > 1000);
-	assert.ok(shot.details.slides[0].overflow.includes(badName));
+
+	const report = shot.details;
+	const overflow = shot.content[0].text;
+	assert.ok(overflow.includes("rendered_lines"));
+	assert.deepEqual(report.flagged_slides, [1]);
+	const dense = report.density[0].shapes.find((row: any) => row.rendered_lines > 1);
+	assert.ok(dense, "density names the shape that actually overflows");
+	assert.ok(dense.slack_in < 0);
+	assert.deepEqual(report.compared.map((row: any) => row.changed_px_ratio), [0]);
 });
 
-test("clone + set_text preserve style and update the copy only", async () => {
+test("ppt_doctor resolves versions, soffice and font substitution", async () => {
 	const cwd = await tempDir();
-	const deck = "deck.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-
-	const added = await call(
-		"ppt_add_text",
-		{
-			path: deck,
-			slide: 1,
-			text: "原始标题",
-			x: 1,
-			y: 1,
-			w: 8,
-			h: 1,
-			size: 30,
-			font: "微软雅黑",
-			color: "#1F4E79",
-		},
-		cwd,
-	);
-	const name = added.details.name as string;
-
-	await call("ppt_clone", { path: deck, source: 1, count: 1 }, cwd);
-	const edited = await call(
-		"ppt_set_text",
-		{ path: deck, slide: 2, shape: name, text: "克隆页标题\n第二段" },
-		cwd,
-	);
-	assert.equal(edited.details.paragraphs, 2);
-
-	const inspected = await call("ppt_inspect", { path: deck }, cwd);
-	assert.equal(inspected.details.slide_count, 2);
-	const copyShape = inspected.details.slides[1].shapes.find((shape: any) => shape.name === name);
-	assert.equal(copyShape.text, "克隆页标题\n第二段");
-	assert.equal(copyShape.style.size_pt, 30);
-	assert.equal(copyShape.style.font, "微软雅黑");
-	const sourceShape = inspected.details.slides[0].shapes.find((shape: any) => shape.name === name);
-	assert.equal(sourceShape.text, "原始标题");
-});
-
-test("apply batches edits atomically, supports dry run and reports failures", async () => {
-	const cwd = await tempDir();
-	const deck = "batch.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	const added = await call(
-		"ppt_add_text",
-		{ path: deck, slide: 1, text: "初始", x: 1, y: 1, w: 5, h: 1, size: 20 },
-		cwd,
-	);
-	const id = added.details.id as number;
-	const ops = [
-		{ op: "set_text", slide: 1, shape: `#${id}`, text: "批量改完" },
-		{ op: "add_text", slide: 1, x: 1, y: 3, w: 5, text: "新增一段", size: 16 },
-		{ op: "set_notes", slide: 1, text: "讲者备注" },
-	];
-
-	const dry = await call("ppt_apply", { path: deck, ops, dryRun: true, shot: false }, cwd);
-	assert.match(dry.content[0].text, /validated \(dry run\): 3\/3 ops/);
-	let inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
-	assert.equal(
-		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
-		"初始",
-	);
-
-	const applied = await call("ppt_apply", { path: deck, ops, shot: false }, cwd);
-	assert.match(applied.content[0].text, /batch saved: 3\/3 ops/);
-	inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
-	assert.equal(
-		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
-		"批量改完",
-	);
-	assert.equal(inspected.details.slides[0].notes, "讲者备注");
-	assert.ok(inspected.details.slides[0].shapes.some((shape: any) => shape.text === "新增一段"));
-
-	const bad = await call(
-		"ppt_apply",
-		{ path: deck, ops: [{ op: "set_text", slide: 1, shape: "#999", text: "x" }], shot: false },
-		cwd,
-	);
-	assert.match(bad.content[0].text, /NOT saved/);
-	assert.match(bad.content[0].text, /1 op error/);
-	inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
-	assert.equal(
-		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
-		"批量改完",
-	);
-});
-
-test("delete_shape, set_notes and table_style tools expose ids and results", async () => {
-	const cwd = await tempDir();
-	const deck = "tools.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	const added = await call(
-		"ppt_add_text",
-		{ path: deck, slide: 1, text: "待删除", x: 1, y: 1, w: 3, h: 1 },
-		cwd,
-	);
-	const notes = await call("ppt_set_notes", { path: deck, slide: 1, text: "第一段\n第二段" }, cwd);
-	assert.equal(notes.details.paragraphs, 2);
-	const deleted = await call("ppt_delete_shape", { path: deck, slide: 1, shape: `#${added.details.id}` }, cwd);
-	assert.equal(deleted.details.deleted, true);
-
-	const table = await call(
-		"ppt_add_table",
-		{
-			path: deck,
-			slide: 1,
-			rows: 2,
-			cols: 2,
-			x: 1,
-			y: 3,
-			w: 5,
-			h: 1.5,
-			data: [
-				["指标", "值"],
-				["EF", "52"],
-			],
-			headerFill: "#1F4E79",
-			headerColor: "#FFFFFF",
-			zebra: "#EAF1F8",
-		},
-		cwd,
-	);
-	assert.match(table.content[0].text, /模板里没有任何表格样例/);
-	const styled = await call(
-		"ppt_table_style",
-		{ path: deck, slide: 1, shape: `#${table.details.id}`, border: "none", colWidths: [2, 3] },
-		cwd,
-	);
-	assert.equal(styled.details.rows, 2);
-	assert.equal(styled.details.cols, 2);
-
-	const inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
-	const texts = inspected.details.slides[0].shapes.map((shape: any) => shape.text);
-	assert.ok(!texts.includes("待删除"));
-	assert.ok(inspected.details.slides[0].shapes.some((shape: any) => shape.id === table.details.id));
-	assert.equal(inspected.details.slides[0].notes, "第一段\n第二段");
-});
-
-test("add_shape draws cards and chevrons with stable names", async () => {
-	const cwd = await tempDir();
-	const deck = "shapes.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-
-	const card = await call(
-		"ppt_add_shape",
-		{
-			path: deck,
-			slide: 1,
-			kind: "roundrect",
-			x: 1,
-			y: 1.5,
-			w: 4,
-			h: 1.4,
-			radius: 0.06,
-			fill: "#F4F7FB",
-			line: "#CAD9E8",
-			text: "卡片标题",
-			size: 16,
-			color: "#1F4E79",
-			name: "Card 1",
-		},
-		cwd,
-	);
-	assert.equal(card.details.kind, "roundrect");
-	assert.equal(card.details.name, "Card 1");
-	assert.match(card.content[0].text, /added roundrect "Card 1"/);
-
-	const chevron = await call(
-		"ppt_add_shape",
-		{ path: deck, slide: 1, kind: "chevron", x: 5.5, y: 1.5, w: 1.4, h: 0.9, fill: "#2E75B6" },
-		cwd,
-	);
-	assert.equal(chevron.details.kind, "chevron");
-
-	const bar = await call("ppt_add_shape", { path: deck, slide: 1, kind: "bar", x: 1, y: 1.4, w: 4 }, cwd);
-	assert.ok(Math.abs(bar.details.box_in[3] - 0.06) < 0.01);
-
-	const inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
-	const names = inspected.details.slides[0].shapes.map((shape: any) => shape.name);
-	assert.ok(names.includes("Card 1"));
-
-	// Shapes are addressable by id afterwards (e.g. for ignore= or deletion).
-	const deleted = await call("ppt_delete_shape", { path: deck, slide: 1, shape: `#${chevron.details.id}` }, cwd);
-	assert.equal(deleted.details.deleted, true);
-});
-
-test("shot supports onlyChanged, density and id/regex ignore", async () => {
-	const cwd = await tempDir();
-	const deck = "incremental.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	await call("ppt_clone", { path: deck, source: 1, count: 2 }, cwd);
-
-	const first = await call("ppt_shot", { path: deck, slides: "1-3", dpi: 60, onlyChanged: true }, cwd);
-	assert.deepEqual(first.details.slides.map((slide: any) => slide.slide), [1, 2, 3]);
-
-	const second = await call("ppt_shot", { path: deck, dpi: 60, onlyChanged: true }, cwd);
-	assert.deepEqual(second.details.slides, []);
-	assert.match(second.content[0].text, /没有(任何)?页面变化|no_changes/);
-
-	const longText = "这一段文字足够长以制造确定的溢出效果。".repeat(6);
-	const flagged = await call(
-		"ppt_add_text",
-		{ path: deck, slide: 2, text: longText, x: 1, y: 1, w: 3, h: 0.4, size: 20, name: "Dense 1" },
-		cwd,
-	);
-	const third = await call("ppt_shot", { path: deck, dpi: 60, onlyChanged: true, density: true }, cwd);
-	assert.deepEqual(third.details.slides.map((slide: any) => slide.slide), [2]);
-	assert.ok(third.details.density[0].capacity >= 1);
-
-	const ignored = await call(
-		"ppt_shot",
-		{ path: deck, slides: "2", dpi: 60, overflow: "strict", ignore: [`#${flagged.details.id}`], density: true },
-		cwd,
-	);
-	const overflowNames = (ignored.details.slides[0].overflow ?? []).map((item: any) => item.shape);
-	assert.ok(!overflowNames.includes("Dense 1"));
-	const stillFlagged = await call("ppt_shot", { path: deck, slides: "2", dpi: 60, overflow: "strict" }, cwd);
-	assert.ok((stillFlagged.details.slides[0].overflow ?? []).length > 0);
-});
-
-test("set_shape moves a placeholder and changes z-order", async () => {
-	const cwd = await tempDir();
-	const deck = "layout.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	const added = await call(
-		"ppt_add_text",
-		{ path: deck, slide: 1, text: "底层图形", x: 1, y: 1, w: 3, h: 1, name: "Base 1" },
-		cwd,
-	);
-	const moved = await call(
-		"ppt_set_shape",
-		{ path: deck, slide: 1, shape: `#${added.details.id}`, x: 2, y: 2, w: 5, h: 1.2, z: "front", name: "Moved 1" },
-		cwd,
-	);
-	assert.deepEqual(moved.details.box_in, [2, 2, 5, 1.2]);
-	assert.equal(moved.details.name, "Moved 1");
-	assert.match(moved.content[0].text, /box \[/);
-});
-
-test("notes_check reports per-slide fingerprints", async () => {
-	const cwd = await tempDir();
-	const deck = "notes.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	await call("ppt_clone", { path: deck, source: 1, count: 1 }, cwd);
-	await call("ppt_set_notes", { path: deck, slide: 1, text: "第一页备注：开场" }, cwd);
-	await call("ppt_set_notes", { path: deck, slide: 2, text: "第二页备注：方法" }, cwd);
-
-	const checked = await call("ppt_notes_check", { path: deck }, cwd);
-	assert.equal(checked.details.notes.length, 2);
-	assert.equal(checked.details.notes[0].first_20, "第一页备注：开场");
-	assert.ok(checked.details.notes.every((row: any) => row.notes_len > 0));
-});
-
-test("shot montage returns one contact sheet", async () => {
-	const cwd = await tempDir();
-	const deck = "montage.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	await call("ppt_clone", { path: deck, source: 1, count: 2 }, cwd);
-	const shot = await call("ppt_shot", { path: deck, slides: "1-3", dpi: 70, montage: 2 }, cwd);
-	const images = shot.content.filter((block: any) => block.type === "image");
-	assert.equal(images.length, 1);
-	assert.equal(shot.details.montage.cols, 2);
-	assert.equal(shot.details.slides.length, 3);
-	assert.ok(shot.details.montage.px[0] > 600);
-});
-
-test("create refuses overwrite and delete refuses emptying the deck", async () => {
-	const cwd = await tempDir();
-	const deck = "deck.pptx";
-	await call("ppt_create", { path: deck }, cwd);
-	await assert.rejects(() => call("ppt_create", { path: deck }, cwd), /已存在/);
-	await assert.rejects(() => call("ppt_delete", { path: deck, slides: "1" }, cwd), /至少保留 1 页/);
-
 	const doctor = await call("ppt_doctor", {}, cwd);
 	assert.ok(doctor.details.python_pptx);
+	assert.ok(doctor.details.fonts);
+	assert.match(doctor.content[0].text, /python-pptx/);
+});
+
+test("keepVersions + compareTo diff the previous build", async () => {
+	const cwd = await tempDir();
+	await mkdir(path.join(cwd, "tpl"), { recursive: true });
+	// A template deck, built with the backend itself.
+	await writeFile(path.join(cwd, "tpl/make.py"), `
+import os
+from pathlib import Path
+from pi_pptx import Deck
+tpl = Path(os.environ["DECK_ROOT"]) / "tpl/template.pptx"
+d = Deck.create(tpl, overwrite=True)
+d.add_text(slide=1, text="模板页", x=1, y=1, w=6, h=1, size=24)
+d.save()
+`);
+	await writeFile(path.join(cwd, "build.py"), `
+import os, sys
+from pathlib import Path
+from pi_pptx import Deck
+ROOT = Path(os.environ["DECK_ROOT"])
+OUT = Path(os.environ["DECK_OUT"])
+word = sys.argv[1] if len(sys.argv) > 1 else "v1"
+D = Deck.create(OUT, template=ROOT / "tpl/template.pptx", overwrite=True)
+D.add_text(slide=1, text=word, x=1, y=2.5, w=6, h=1, size=24)
+D.save()
+D.report()
+`);
+	await call("ppt_run_deck", { script: "tpl/make.py", shot: false }, cwd);
+
+	const first = await call("ppt_run_deck", { script: "build.py", out: "deck.pptx", shot: false, expect: "clean" }, cwd);
+	assert.equal(first.details.ok, true, JSON.stringify(first.content[0].text).slice(0, 500));
+
+	const second = await call(
+		"ppt_run_deck",
+		{ script: "build.py", out: "deck.pptx", args: ["v2"], keepVersions: 1, shot: "changed", dpi: 60 },
+		cwd,
+	);
+	assert.ok(second.details.ok);
+	const text = second.content[0].text as string;
+	const version = /previous version kept at (\S+?\.pptx)/.exec(text)?.[1];
+	assert.ok(version, "stashed version path is reported");
+	const diffed = await call(
+		"ppt_run_deck",
+		{ script: "build.py", out: "deck.pptx", args: ["v2"], shot: "changed", dpi: 60, compareTo: version },
+		cwd,
+	);
+	// The stashed version is the v1 build, the current one is v2: one page differs.
+	assert.ok(diffed.details.shot.compared[0].changed_px_ratio > 0);
+	assert.deepEqual(diffed.details.shot.changed_vs_previous, [1]);
+	// Comparing a deck with itself must be exactly zero on every page.
+	const same = await call(
+		"ppt_run_deck",
+		{ script: "build.py", out: "deck.pptx", args: ["v2"], shot: "changed", dpi: 60, compareTo: "deck.pptx" },
+		cwd,
+	);
+	assert.deepEqual(same.details.shot.compared.map((r: any) => r.changed_px_ratio), [0]);
+	assert.deepEqual(same.details.shot.changed_vs_previous, []);
 });
 
 test("injects the pptx workflow only for PowerPoint prompts", async () => {
@@ -411,7 +332,9 @@ test("injects the pptx workflow only for PowerPoint prompts", async () => {
 		systemPromptOptions: { sections: {} as Record<string, string> },
 	};
 	await handler(pptEvent);
-	assert.ok(pptEvent.systemPromptOptions.sections.pptx_workflow.includes("ppt_clone"));
+	const workflow = pptEvent.systemPromptOptions.sections.pptx_workflow;
+	assert.match(workflow, /ppt_run_deck/);
+	assert.match(workflow, /build_deck\.py/);
 
 	const chatEvent = {
 		type: "before_agent_start",

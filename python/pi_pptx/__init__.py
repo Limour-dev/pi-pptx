@@ -28,13 +28,14 @@ from .doctor import doctor_payload
 from .ops import OP_HANDLERS, apply_one
 from .render import preview_overflow, render_overflow, shot_deck
 from .shapes import inspect_deck, notes_check
-from .utils import KitError, deck_meta, emit, fail, load, save_and_reload
+from .utils import KitError, deck_meta, deck_report, emit, fail, load, save_and_reload
 
 __all__ = [
     "Deck",
     "KitError",
     "OP_HANDLERS",
     "deck_meta",
+    "deck_report",
     "doctor_payload",
     "emit",
     "inspect_deck",
@@ -147,6 +148,19 @@ class Deck:
 
     def meta(self) -> dict:
         return deck_meta(self.prs, self.path or Path("deck.pptx"))
+
+    def report(self) -> dict:
+        """Print the ``@@DECK@@`` line that ``ppt_run_deck`` parses.
+
+        Put ``deck.report()`` right after ``save()``: the tool then knows the
+        slide/shape counts and the pages this run touched, without a second
+        ``ppt_inspect`` round trip.
+        """
+        import json
+
+        payload = deck_report(self.prs, self.path, sorted(self.changed))
+        print("@@DECK@@ " + json.dumps(payload, ensure_ascii=False))
+        return payload
 
     def save(self, out: str | Path | None = None) -> Path:
         """Atomic save (temp file + integrity reopen + replace)."""

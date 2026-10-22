@@ -1,4 +1,8 @@
-"""Run/paragraph writing: fonts, bullets, indents, rich text (``paras=``)."""
+"""Run/paragraph writing: fonts, bullets, indents, rich text (``paras=``).
+
+Also home to :func:`text_fit`, the shared "does this text still fit its box"
+estimator used by ``ppt_inspect`` (before drawing) and ``ppt_shot`` (density).
+"""
 from __future__ import annotations
 
 import copy
@@ -6,7 +10,8 @@ import copy
 from pptx.oxml.ns import qn
 from pptx.util import Inches, Pt
 
-from .utils import ALIGN, BULLET_NONE, FIT, VALIGN, fail, parse_enum, parse_rgb
+from .utils import ALIGN, BULLET_NONE, EMU, FIT, PT_PER_IN, VALIGN, fail, parse_enum, parse_rgb
+
 
 def _set_run_font(run, font: str) -> None:
     """Set latin *and* East-Asian/complex-script typefaces.
@@ -245,3 +250,145 @@ def apply_text_frame_defaults(text_frame, spec: dict) -> None:
         text_frame.vertical_anchor = parse_enum(spec["valign"], VALIGN, "垂直对齐")
     if spec.get("wrap") is False:
         text_frame.word_wrap = False
+
+
+# ------------------------------------------------------------------ text fit
+# Glyph width in em: CJK/full-width are 1, Latin averages ~0.52. A real font
+# metric would need the font file; this is the same ballpark the layout heuristics
+# need, and it errs on the *wide* side (5-10% margin for font substitution).
+_FULLWIDTH_RANGES = (
+    (0x1100, 0x115F),  # Hangul Jamo
+    (0x2E80, 0xA4CF),  # CJK radicals .. Yi
+    (0xAC00, 0xD7A3),  # Hangul syllables
+    (0xF900, 0xFAFF),  # CJK compatibility ideographs
+    (0xFE30, 0xFE6F),  # CJK compatibility forms
+    (0xFF00, 0xFF60),  # full-width forms
+    (0xFFE0, 0xFFE6),
+    (0x1F300, 0x1FAFF),  # emoji
+)
+
+
+def _char_em(char: str) -> float:
+    code = ord(char)
+    for low, high in _FULLWIDTH_RANGES:
+        if low <= code <= high:
+            return 1.0
+    if char.isspace():
+        return 0.28
+    if not char.isprintable():
+        return 0.0
+    return 0.52
+
+
+def _atoms(text: str) -> list[str]:
+    """Split into wrap atoms: one per CJK glyph, one per Latin word.
+
+    PowerPoint breaks CJK anywhere but Latin only at spaces, so a single wide
+    token ("01") overflows sideways instead of wrapping — treating it as one
+    atom keeps the line estimate honest for big numbers in tight boxes.
+    """
+    atoms: list[str] = []
+    buffer = ""
+    for char in text:
+        if _char_em(char) >= 1.0 or char.isspace():
+            if buffer:
+                atoms.append(buffer)
+                buffer = ""
+            atoms.append(" " if char.isspace() else char)
+        else:
+            buffer += char
+    if buffer:
+        atoms.append(buffer)
+    return atoms
+
+
+def _wrap_lines(text: str, size: float, usable_w_pt: float) -> int:
+    if not text.strip():
+        return 1
+    lines = 1
+    current = 0.0
+    for atom in _atoms(text):
+        if atom == " ":
+            current += 0.28 * size
+            continue
+        width = sum(_char_em(char) for char in atom) * size
+        if current > 0 and current + width > usable_w_pt:
+            lines += 1
+            current = width
+        else:
+            current += width
+    return lines
+
+
+def _frame_margins(text_frame) -> tuple[float, float, float, float]:
+    """left, right, top, bottom insets in EMU (DrawingML defaults: 0.1in / 0.05in)."""
+    def value(name, default):
+        inset = getattr(text_frame, name, None)
+        return default if inset is None else int(inset)
+
+    return (
+        value("margin_left", 91440),
+        value("margin_right", 91440),
+        value("margin_top", 45720),
+        value("margin_bottom", 45720),
+    )
+
+
+def text_fit(shape) -> dict | None:
+    """Estimate whether a shape's text still fits the shape's box.
+
+    Answers the question the agent could not answer before rendering: "how many
+    lines does this box need, and how many does it hold?" ``needed_in`` is
+    ``lines x size x 1.35`` (the rule of thumb a hand-built deck uses) plus the
+    text-frame insets, so it is comparable with ``box_h_in``.
+
+    ``fits`` compares *line counts*, not inches: a 13pt single line in a 0.28in
+    label box spills a few points of leading by geometry yet renders exactly as
+    intended, which is why the inch comparison alone cried wolf on every label.
+    ``slack_in`` is still reported so a caller can see the raw margin.
+
+    Returns ``None`` for shapes without text, otherwise ``size_pt``,
+    ``est_lines``, ``capacity_lines``, ``needed_in``, ``box_h_in``, ``slack_in``
+    and ``fits``.
+    """
+    if not getattr(shape, "has_text_frame", False):
+        return None
+    tf = shape.text_frame
+    if shape.width is None or shape.height is None:
+        return None
+    if not tf.text.strip():
+        return None
+    margin_l, margin_r, margin_t, margin_b = _frame_margins(tf)
+    usable_w_pt = max(1.0, (shape.width - margin_l - margin_r) / EMU * PT_PER_IN)
+    box_h_in = round(shape.height / EMU, 3)
+
+    lines = 0
+    needed_pt = 0.0
+    max_size = 0.0
+    line_h_in = 0.0
+    for para in tf.paragraphs:
+        size = next((run.font.size.pt for run in para.runs if run.font.size is not None), None)
+        size = float(size) if size is not None else 18.0
+        max_size = max(max_size, size)
+        spacing = 1.0
+        if para.line_spacing is not None and isinstance(para.line_spacing, float):
+            spacing = max(0.5, float(para.line_spacing))
+        text = "".join(run.text for run in para.runs) or para.text
+        para_lines = _wrap_lines(text, size, usable_w_pt)
+        lines += para_lines
+        space_after = para.space_after.pt if para.space_after is not None else 0.0
+        needed_pt += para_lines * size * 1.35 * spacing + float(space_after)
+        line_h_in = max(line_h_in, size * 1.35 * spacing / PT_PER_IN)
+    needed_in = round(needed_pt / PT_PER_IN + (margin_t + margin_b) / EMU, 3)
+    inset_in = (margin_t + margin_b) / EMU
+    capacity = max(1, int((box_h_in - inset_in) // line_h_in)) if line_h_in else 1
+    return {
+        "estimated": True,
+        "size_pt": round(max_size, 1),
+        "est_lines": lines,
+        "capacity_lines": capacity,
+        "needed_in": needed_in,
+        "box_h_in": box_h_in,
+        "slack_in": round(box_h_in - needed_in, 3),
+        "fits": lines <= capacity,
+    }

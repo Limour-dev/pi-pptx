@@ -5,11 +5,15 @@ This is the acceptance case for `ppt_add_shape`: five rounded cards, four
 chevrons, one accent bar, a header rule and a footer label — every element is a
 library call, and re-running the script rebuilds the deck from the template.
 
-    python3 examples/cards_demo.py /home/limour/pi-test/PPT模板.pptx /tmp/cards.pptx
-    python3 python/pptkit.py shot /tmp/cards.pptx --dpi 110
+    python3 examples/cards_demo.py 模板.pptx cards.pptx
+    python3 python/pptkit.py shot cards.pptx --dpi 110
+
+The template is a required argument (or DECK_TEMPLATE): this demo shows how to
+reuse a real template's design, so a blank deck would defeat the purpose.
 """
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -17,8 +21,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "python"))
 
 from pi_pptx import Deck, emit  # noqa: E402
 
-TEMPLATE = "/home/limour/pi-test/PPT模板.pptx"
-OUT = "/tmp/pi-pptx-cards.pptx"
+TEMPLATE = os.environ.get("DECK_TEMPLATE", "")
+OUT = os.environ.get("DECK_OUT", "cards.pptx")
 
 CARD_FILL = "#F4F7FB"
 CARD_LINE = "#CAD9E8"
@@ -132,8 +136,8 @@ def build(template: str, out: str) -> Deck:
 def main() -> None:
     template = sys.argv[1] if len(sys.argv) > 1 else TEMPLATE
     out = sys.argv[2] if len(sys.argv) > 2 else OUT
-    if not Path(template).exists():
-        print(f"模板不存在: {template}", file=sys.stderr)
+    if not template or not Path(template).exists():
+        print("需要一个模板: 传参或设置 DECK_TEMPLATE", file=sys.stderr)
         raise SystemExit(2)
 
     deck = build(template, out)

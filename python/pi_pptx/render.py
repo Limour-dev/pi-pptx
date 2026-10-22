@@ -221,7 +221,9 @@ def rendered_text_boxes(slide, page, slide_w_pt: float, ignore=None) -> dict[int
     if not shapes:
         return {}
     assigned = _assign_lines(shapes, _rendered_lines(page))
-    scale = EMU / PT_PER_IN
+    # PyMuPDF bboxes are in points; every other box in this module is inches, so
+    # mixing them made overlap areas nonsensical (area_in2 ~ 1e11 on a 100 in²
+    # canvas) and made `ratio` incomparable between pairs.
     boxes = {}
     for index, matched in assigned.items():
         if not matched:
@@ -231,10 +233,10 @@ def rendered_text_boxes(slide, page, slide_w_pt: float, ignore=None) -> dict[int
         ux1 = max(b[2] for b in matched)
         uy1 = max(b[3] for b in matched)
         boxes[shapes[index]["id"]] = [
-            round(ux0 * scale, 3),
-            round(uy0 * scale, 3),
-            round((ux1 - ux0) * scale, 3),
-            round((uy1 - uy0) * scale, 3),
+            round(ux0 / PT_PER_IN, 3),
+            round(uy0 / PT_PER_IN, 3),
+            round((ux1 - ux0) / PT_PER_IN, 3),
+            round((uy1 - uy0) / PT_PER_IN, 3),
         ]
     return boxes
 
@@ -251,7 +253,9 @@ def detect_overflow(
 
     Returns ``(overflow, suppressed)``. ``suppressed`` lists the sides that
     *would* have been reported but are impossible by construction, so a caller
-    can tell "clean" apart from "not checked".
+    can tell "clean" apart from "not checked". A top-anchored spill smaller than
+    ``TEMPLATE_TOP_SPILL_PT`` is not reported at all: it is the leading of the
+    template's own title frame and repeats on every page.
 
     Only top-level shapes with text are checked: group children store relative
     coordinates, which do not map onto the rendered page.
@@ -296,6 +300,9 @@ def detect_overflow(
         # Rendered line boxes include leading/descender padding, so a small
         # vertical spill is normal. A real overflow is roughly one extra line.
         line_height = max(b[3] - b[1] for b in matched)
+        rendered_lines = len(matched)
+        needed_in = round((uy1 - uy0) / PT_PER_IN, 2)
+        slack_in = round(box_inches[3] - needed_in, 2) if box_inches else None
         if mode == "strict":
             # Font substitution changes ascent/descent a little, so "strict"
             # still tolerates a fraction of one line — a real overflow is a
@@ -321,12 +328,21 @@ def detect_overflow(
         elif anchor == "bottom" and uy1 > y1 + 0.5:
             hidden.append({"side": "bottom", "spill_pt": round(uy1 - y1, 1), "reason": "anchor=b"})
         if uy0 < y0 - vtol:
-            if anchor == "top":
-                hidden.append({"side": "top", "spill_pt": round(y0 - uy0, 1), "reason": "anchor=t"})
+            spill = round(y0 - uy0, 1)
+            # Layout-inherited geometry: a top-anchored title whose rendered line
+            # box pokes a few points above its own frame does it on every page of
+            # the template. Reporting it as "suppressed" on all 22 pages buried
+            # the real findings.
+            if anchor == "top" and spill < TEMPLATE_TOP_SPILL_PT:
+                pass
+            elif anchor == "top":
+                hidden.append({"side": "top", "spill_pt": spill, "reason": "anchor=t"})
             else:
-                over["top_pt"] = round(y0 - uy0, 1)
+                over["top_pt"] = spill
         elif anchor == "top" and uy0 < y0 - 0.5:
-            hidden.append({"side": "top", "spill_pt": round(y0 - uy0, 1), "reason": "anchor=t"})
+            spill = round(y0 - uy0, 1)
+            if spill >= TEMPLATE_TOP_SPILL_PT:
+                hidden.append({"side": "top", "spill_pt": spill, "reason": "anchor=t"})
         if over:
             found.append(
                 {
@@ -334,6 +350,13 @@ def detect_overflow(
                     "id": sid,
                     "box_in": box_inches,
                     "overflow_pt": over,
+                    # Measured, not estimated: how many lines really rendered and
+                    # how much height they took. Without these the report said
+                    # "bottom_pt 26.8" and left "fix the box or the font?"
+                    # undecidable for three rounds.
+                    "rendered_lines": rendered_lines,
+                    "needed_in": needed_in,
+                    "slack_in": slack_in,
                     "text": txt[:40],
                 }
             )
@@ -347,6 +370,11 @@ def detect_overflow(
                 }
             )
     return found, suppressed
+
+
+# A top-anchored line whose rendered bbox starts less than this above its own
+# frame is template geometry (leading), not a layout bug.
+TEMPLATE_TOP_SPILL_PT = 5.0
 
 
 CONTAINER_PLACEHOLDERS = {
@@ -449,7 +477,9 @@ def detect_overlaps(slide, ignore=None, text_boxes: dict[int, list[float]] | Non
             bx, by, bw, bh = b["box"]
             ix = max(0.0, min(ax + aw, bx + bw) - max(ax, bx))
             iy = max(0.0, min(ay + ah, by + bh) - max(ay, by))
-            area = ix * iy
+            # Never report more overlap than the smaller shape holds: rounding in
+            # the boxes used to produce ratio > 1 and un-sortable areas.
+            area = min(ix * iy, a["area"], b["area"])
             if area < 0.05:
                 continue
             ratio = area / min(a["area"], b["area"])
@@ -618,61 +648,108 @@ def region_for_page(spec, page_no: int) -> list[float] | None:
     return _region_tuple(spec)
 
 
-def estimate_capacity(slide) -> int:
-    """Rough declared line capacity of one slide (screening number).
+def slide_density(slide, page, slide_w_pt: float, slide_h_pt: float, ignore=None) -> dict:
+    """Per-shape rendered-vs-available height (the actionable density table).
 
-    Capacity comes from the shapes' boxes and their first run's font size
-    (falling back to 18pt). The *rendered* line count is the measurement; this
-    only answers "could this page ever hold that much text".
+    The old page-level "lines vs capacity" summed every text box's capacity and
+    compared it with every rendered line, so a page with one 48-line table cell
+    looked 2.4x over capacity while nothing actually overflowed. Text that does
+    not fit is always *one shape* that is too short, so the measurement belongs
+    per shape: ``box_h_in`` vs the height the rendered lines really took.
     """
-    from pptx.enum.shapes import MSO_SHAPE_TYPE as _TYPE
-
-    capacity = 0
-    for shape in slide.shapes:
-        if shape.shape_type in (_TYPE.GROUP, _TYPE.PICTURE):
-            continue
-        if not shape.has_text_frame or shape.height is None:
-            continue
-        text = shape.text_frame.text.strip()
-        if not text:
-            continue
-        size = 18.0
-        for para in shape.text_frame.paragraphs:
-            for run in para.runs:
-                if run.font.size is not None:
-                    size = run.font.size.pt
-                    break
-            if size != 18.0:
-                break
-        line_h = max(6.0, size * 1.35)
-        capacity += max(1, int((shape.height / EMU * PT_PER_IN) // line_h))
-    return capacity
-
-
-def slide_density(slide, page, slide_w_pt: float, slide_h_pt: float) -> dict:
-    """First text line + rendered/expected line counts (a scanning table)."""
-    rendered = 0
+    ignore = read_only_ignore(ignore)
+    rendered_lines = 0
     for block in page.get_text("dict")["blocks"]:
         if block.get("type") != 0:
             continue
         for line in block.get("lines", []):
             if "".join(span.get("text", "") for span in line.get("spans", [])).strip():
-                rendered += 1
-    capacity = estimate_capacity(slide)
+                rendered_lines += 1
+
     info: dict = {"slide": int(page.number) + 1}
     first = ""
-    for shape in slide.shapes:
-        if shape.has_text_frame and shape.text_frame.text.strip():
-            first = shape.text_frame.text.strip().split("\n")[0][:40]
-            break
+    rows = []
+    shapes = _text_shapes(slide, ignore, slide_w_pt, page)
+    assigned = _assign_lines(shapes, _rendered_lines(page))
+    for index, entry in enumerate(shapes):
+        matched = assigned.get(index) or []
+        if not matched:
+            continue
+        if not first:
+            first = entry["text"].split("\n")[0][:40]
+        top = min(b[1] for b in matched)
+        bottom = max(b[3] for b in matched)
+        needed_in = round((bottom - top) / PT_PER_IN, 2)
+        line_h_in = max(0.02, needed_in / len(matched))
+        box_h_in = entry["box_in"][3] if entry["box_in"] else None
+        row = {
+            "shape": entry["name"],
+            "id": entry["id"],
+            "rendered_lines": len(matched),
+            "needed_in": needed_in,
+        }
+        if box_h_in:
+            row["box_h_in"] = round(box_h_in, 2)
+            row["slack_in"] = round(box_h_in - needed_in, 2)
+            # Line counts, not inches: a rendered line box carries leading, so a
+            # 40pt title in the template's own 0.77in frame measures -0.11in on
+            # every page and would drown the real findings.
+            capacity = max(1, int((box_h_in - 0.1) // line_h_in))
+            row["capacity_lines"] = capacity
+            if len(matched) > capacity:
+                row["tight"] = True
+        rows.append(row)
     if first:
         info["first_line"] = first
-    info["lines"] = rendered
-    if capacity:
-        info["capacity"] = capacity
-        if rendered > capacity:
+    info["lines"] = rendered_lines
+    if rows:
+        info["shapes"] = rows
+        tight = [row for row in rows if row.get("tight")]
+        if tight:
             info["dense"] = True
+            info["tight_shapes"] = [row["shape"] for row in tight]
     return info
+
+
+def compare_pages(path_a: Path, path_b: Path, pages: list[int], dpi: int = 60) -> list[dict]:
+    """Rasterised per-page difference between two decks ("did my fix break X?").
+
+    A coordinate change on slide 13 can squeeze the card on slide 12; only the
+    pixels know. Rendering both decks at a low dpi and counting changed pixels is
+    cheap, and the ratio answers the only question that matters: which pages
+    changed *unexpectedly*.
+    """
+    import pymupdf
+
+    pdf_a, _ka, _ca = deck_pdf(Path(path_a))
+    pdf_b, _kb, _cb = deck_pdf(Path(path_b))
+    doc_a = pymupdf.open(pdf_a)
+    doc_b = pymupdf.open(pdf_b)
+    rows = []
+    try:
+        for page_no in pages:
+            if not (1 <= page_no <= doc_a.page_count and 1 <= page_no <= doc_b.page_count):
+                continue
+            pix_a = doc_a[page_no - 1].get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+            pix_b = doc_b[page_no - 1].get_pixmap(dpi=dpi, colorspace=pymupdf.csGRAY)
+            if (pix_a.width, pix_a.height) != (pix_b.width, pix_b.height):
+                rows.append({"slide": page_no, "changed_px_ratio": 1.0, "note": "page size differs"})
+                continue
+            samples_a, samples_b = pix_a.samples, pix_b.samples
+            if samples_a == samples_b:
+                ratio = 0.0
+            else:
+                # XOR the two sample blobs and count non-zero bytes: pure C, so a
+                # whole deck stays well under a second.
+                xor = (int.from_bytes(samples_a, "big") ^ int.from_bytes(samples_b, "big")).to_bytes(
+                    len(samples_a), "big"
+                )
+                ratio = (len(xor) - xor.count(0)) / max(1, len(xor))
+            rows.append({"slide": page_no, "changed_px_ratio": round(ratio, 4)})
+    finally:
+        doc_a.close()
+        doc_b.close()
+    return rows
 
 
 def changed_slides_since_last_shot(prs, path: Path) -> list[int]:
@@ -723,6 +800,8 @@ def shot_deck(
     only_changed: bool = False,
     changed_slides: list[int] | None = None,
     density: bool = False,
+    compare_to: str | None = None,
+    expect: str | None = None,
 ) -> dict:
     """Render pages to PNG and return the report payload (no printing).
 
@@ -798,7 +877,7 @@ def shot_deck(
         shots.append(entry)
         files.append(target)
         if density:
-            row = slide_density(prs.slides[page_no - 1], page, slide_w_pt, slide_h_pt)
+            row = slide_density(prs.slides[page_no - 1], page, slide_w_pt, slide_h_pt, ignore_filter)
             row["slide"] = page_no
             density_rows.append(row)
     doc.close()
@@ -821,6 +900,26 @@ def shot_deck(
     if region is not None:
         resolved = _region_spec(region)
         result["region_in"] = resolved if isinstance(resolved, dict) else _region_tuple(resolved)
+    # Which pages carry flags, and (optionally) a build gate: expect="clean" turns
+    # the exit status into something a script can assert on.
+    flagged = [shot["slide"] for shot in shots if shot.get("overflow") or shot.get("overlaps")]
+    result["flagged_slides"] = flagged
+    if expect:
+        result["clean"] = not flagged
+        if flagged:
+            result["expectation_failed"] = True
+            result["expectation"] = expect
+    if compare_to:
+        previous = Path(compare_to).expanduser()
+        if not previous.exists():
+            fail(f"compare_to 文件不存在: {previous}")
+        compared = compare_pages(previous, path, [shot["slide"] for shot in shots])
+        result["compare_to"] = str(previous.resolve())
+        result["compared"] = compared
+        # Any non-zero ratio means the page is not byte-identical; the threshold
+        # only filters rasteriser jitter. A one-word edit is ~0.0005, a geometry
+        # change is orders of magnitude larger.
+        result["changed_vs_previous"] = [row["slide"] for row in compared if row["changed_px_ratio"] > 0.0001]
     if density:
         result["density"] = density_rows
     if montage:

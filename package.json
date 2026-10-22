@@ -1,7 +1,7 @@
 {
 	"name": "pi-pptx",
-	"version": "0.3.0",
-	"description": "Author PowerPoint decks from existing templates in pi: inspect, clone, draw, edit, render and visually self-check slides.",
+	"version": "0.4.0",
+	"description": "Build PowerPoint decks from existing templates in pi: run a re-runnable build script, then inspect and visually self-check the rendered slides.",
 	"type": "module",
 	"license": "GPL-3.0-only",
 	"keywords": [
@@ -14,6 +14,7 @@
 	"files": [
 		"extensions",
 		"python",
+		"examples",
 		"pyproject.toml",
 		"README.md",
 		"LICENSE"

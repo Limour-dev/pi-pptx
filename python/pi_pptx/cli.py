@@ -66,6 +66,8 @@ def cmd_shot(args):
         only_changed=args.only_changed,
         changed_slides=args.changed_slides,
         density=args.density,
+        compare_to=args.compare_to,
+        expect=args.expect,
     )
     emit(payload)
 
@@ -480,7 +482,12 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("inspect", help="版式/形状 JSON")
     p.add_argument("pptx")
     p.add_argument("--slides", help="如 1,3 或 2-4；默认全部")
-    p.add_argument("--mode", choices=["full", "summary"], default="full", help="summary 只给每页概览")
+    p.add_argument(
+        "--mode",
+        choices=["full", "summary", "text"],
+        default="full",
+        help="summary 每页概览；text 只要每页文字（用于校对术语/错别字）",
+    )
     p.add_argument("--depth", type=int, default=99, help="组合递归深度（0 = 不展开子形状）")
     p.set_defaults(func=cmd_inspect)
 
@@ -498,7 +505,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--only-changed", action=argparse.BooleanOptionalAction, default=False,
                    help="只渲染 --changed-slides 里列出的改动页（差分渲染）")
     p.add_argument("--changed-slides", help="改动页，如 3,7,9（配合 --only-changed）")
-    p.add_argument("--density", action="store_true", help="附带每页首行与行数密度表")
+    p.add_argument("--density", action="store_true", help="附带逐形状的渲染行数/所需高度表")
+    p.add_argument("--compare-to", help="与上一版 pptx 做像素对比，报每页变化比例")
+    p.add_argument(
+        "--expect",
+        choices=["clean"],
+        help="expect=clean 时返回 clean=false / expectation_failed=true（供构建门禁判断）",
+    )
     p.set_defaults(func=cmd_shot)
 
     p = sub.add_parser("create", help="新建/复制模板生成 pptx")

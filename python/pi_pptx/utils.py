@@ -15,6 +15,7 @@ from pathlib import Path
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import MSO_ANCHOR, MSO_AUTO_SIZE, PP_ALIGN
 
 R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
@@ -187,6 +188,35 @@ def deck_meta(prs, path: Path) -> dict:
         "slide_count": len(prs.slides),
         "slide_size_in": [round(prs.slide_width / EMU, 3), round(prs.slide_height / EMU, 3)],
     }
+
+
+def deck_report(prs, path, changed_slides=None) -> dict:
+    """One-line deck summary for the ``@@DECK@@`` stdout protocol.
+
+    A build script ends with ``deck.report()`` and ``ppt_run_deck`` learns the
+    page/shape counts and which pages changed without a second inspect call.
+    """
+    shapes = tables = pictures = notes = 0
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            shapes += 1
+            if getattr(shape, "has_table", False) and shape.has_table:
+                tables += 1
+            elif shape.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                pictures += 1
+        if slide.has_notes_slide and slide.notes_slide.notes_text_frame.text.strip():
+            notes += 1
+    payload = {
+        "out": str(Path(path).resolve()) if path else None,
+        "slides": len(prs.slides),
+        "shapes": shapes,
+        "tables": tables,
+        "pictures": pictures,
+        "notes": notes,
+    }
+    if changed_slides:
+        payload["changed_slides"] = list(changed_slides)
+    return payload
 
 
 class ShapeFilter:

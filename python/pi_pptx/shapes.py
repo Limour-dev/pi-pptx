@@ -5,7 +5,9 @@ import difflib
 
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 
+from .text import text_fit
 from .utils import EMU, box_in, fail, parse_pages
+
 
 def iter_shapes(shapes, prefix: str = ""):
     """Yield (shape, path). Group children are addressed as 'Group 5/TextBox 2'."""
@@ -176,6 +178,11 @@ def shape_info(shape, path: str, top_index: int | None = None, tf=IDENTITY_TF, d
         style = text_style(shape.text_frame)
         if style:
             info["style"] = style
+        # Answers "will this fit?" before drawing instead of after a render:
+        # est_lines / needed_in vs box_h_in / slack_in.
+        fit = text_fit(shape)
+        if fit:
+            info["text_fit"] = fit
     if getattr(shape, "has_table", False) and shape.has_table:
         info["table"] = [[cell.text for cell in row.cells] for row in shape.table.rows]
     if getattr(shape, "has_chart", False) and shape.has_chart:
@@ -315,6 +322,23 @@ def layout_catalog(prs) -> list[dict]:
     return catalog
 
 
+def slide_texts(prs, idx: int) -> list[dict]:
+    """Flat {shape, id, text} rows for proofreading the *product*, not the source.
+
+    Grepping build_deck.py only proves what the script says; terminology drift
+    ("净资产" vs "心脏磁共振") has to be checked on the deck that was saved.
+    """
+    rows = []
+    for shape in prs.slides[idx].shapes:
+        if not shape.has_text_frame:
+            continue
+        text = shape.text_frame.text
+        if not text.strip():
+            continue
+        rows.append({"shape": shape.name, "id": shape.shape_id, "text": text})
+    return rows
+
+
 def inspect_deck(prs, path, *, mode: str = "full", slides=None, depth: int = 99) -> dict:
     from .utils import deck_meta
 
@@ -323,13 +347,32 @@ def inspect_deck(prs, path, *, mode: str = "full", slides=None, depth: int = 99)
     depth = max(0, int(depth))
     out = deck_meta(prs, path)
     out["mode"] = mode
+    if mode == "text":
+        out["slides"] = [{"index": p, "shapes": slide_texts(prs, p - 1)} for p in pages]
+        out["inspected_slides"] = pages
+        return out
     out["layouts"] = layout_catalog(prs)
     if mode == "summary":
         out["slides"] = [slide_summary(prs, p - 1) for p in pages]
     else:
         out["slides"] = [slide_info(prs, p - 1, depth) for p in pages]
+    # Cheap (disk-cached fc-match) and decisive for layout: a substituted face is
+    # ~5% wider, which is the margin every text box has to leave.
+    substitutions = _font_substitutions()
+    if substitutions:
+        out["font_substitutions"] = substitutions
     out["inspected_slides"] = pages
     return out
+
+
+def _font_substitutions() -> dict:
+    """Requested CJK faces that the renderer will substitute (render.py owns it)."""
+    from .render import _font_substitutions as probe  # local import: render imports nothing here
+
+    try:
+        return probe()
+    except Exception:
+        return {}
 
 
 def notes_check(prs, slides=None) -> dict:
