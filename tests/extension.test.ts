@@ -70,6 +70,10 @@ test("registers the pptx toolset and command", () => {
 		"ppt_add_text",
 		"ppt_add_image",
 		"ppt_add_table",
+		"ppt_delete_shape",
+		"ppt_set_notes",
+		"ppt_table_style",
+		"ppt_apply",
 		"ppt_delete",
 	]) {
 		assert.ok(tools.has(name), `${name} registered`);
@@ -154,6 +158,118 @@ test("clone + set_text preserve style and update the copy only", async () => {
 	assert.equal(copyShape.style.font, "微软雅黑");
 	const sourceShape = inspected.details.slides[0].shapes.find((shape: any) => shape.name === name);
 	assert.equal(sourceShape.text, "原始标题");
+});
+
+test("apply batches edits atomically, supports dry run and reports failures", async () => {
+	const cwd = await tempDir();
+	const deck = "batch.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	const added = await call(
+		"ppt_add_text",
+		{ path: deck, slide: 1, text: "初始", x: 1, y: 1, w: 5, h: 1, size: 20 },
+		cwd,
+	);
+	const id = added.details.id as number;
+	const ops = [
+		{ op: "set_text", slide: 1, shape: `#${id}`, text: "批量改完" },
+		{ op: "add_text", slide: 1, x: 1, y: 3, w: 5, text: "新增一段", size: 16 },
+		{ op: "set_notes", slide: 1, text: "讲者备注" },
+	];
+
+	const dry = await call("ppt_apply", { path: deck, ops, dryRun: true, shot: false }, cwd);
+	assert.match(dry.content[0].text, /validated \(dry run\): 3\/3 ops/);
+	let inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	assert.equal(
+		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
+		"初始",
+	);
+
+	const applied = await call("ppt_apply", { path: deck, ops, shot: false }, cwd);
+	assert.match(applied.content[0].text, /batch saved: 3\/3 ops/);
+	inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	assert.equal(
+		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
+		"批量改完",
+	);
+	assert.equal(inspected.details.slides[0].notes, "讲者备注");
+	assert.ok(inspected.details.slides[0].shapes.some((shape: any) => shape.text === "新增一段"));
+
+	const bad = await call(
+		"ppt_apply",
+		{ path: deck, ops: [{ op: "set_text", slide: 1, shape: "#999", text: "x" }], shot: false },
+		cwd,
+	);
+	assert.match(bad.content[0].text, /NOT saved/);
+	assert.match(bad.content[0].text, /1 op error/);
+	inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	assert.equal(
+		inspected.details.slides[0].shapes.find((shape: any) => shape.id === id).text,
+		"批量改完",
+	);
+});
+
+test("delete_shape, set_notes and table_style tools expose ids and results", async () => {
+	const cwd = await tempDir();
+	const deck = "tools.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	const added = await call(
+		"ppt_add_text",
+		{ path: deck, slide: 1, text: "待删除", x: 1, y: 1, w: 3, h: 1 },
+		cwd,
+	);
+	const notes = await call("ppt_set_notes", { path: deck, slide: 1, text: "第一段\n第二段" }, cwd);
+	assert.equal(notes.details.paragraphs, 2);
+	const deleted = await call("ppt_delete_shape", { path: deck, slide: 1, shape: `#${added.details.id}` }, cwd);
+	assert.equal(deleted.details.deleted, true);
+
+	const table = await call(
+		"ppt_add_table",
+		{
+			path: deck,
+			slide: 1,
+			rows: 2,
+			cols: 2,
+			x: 1,
+			y: 3,
+			w: 5,
+			h: 1.5,
+			data: [
+				["指标", "值"],
+				["EF", "52"],
+			],
+			headerFill: "#1F4E79",
+			headerColor: "#FFFFFF",
+			zebra: "#EAF1F8",
+		},
+		cwd,
+	);
+	assert.match(table.content[0].text, /模板里没有任何表格样例/);
+	const styled = await call(
+		"ppt_table_style",
+		{ path: deck, slide: 1, shape: `#${table.details.id}`, border: "none", colWidths: [2, 3] },
+		cwd,
+	);
+	assert.equal(styled.details.rows, 2);
+	assert.equal(styled.details.cols, 2);
+
+	const inspected = await call("ppt_inspect", { path: deck, slides: "1" }, cwd);
+	const texts = inspected.details.slides[0].shapes.map((shape: any) => shape.text);
+	assert.ok(!texts.includes("待删除"));
+	assert.ok(inspected.details.slides[0].shapes.some((shape: any) => shape.id === table.details.id));
+	assert.equal(inspected.details.slides[0].notes, "第一段\n第二段");
+});
+
+test("shot montage returns one contact sheet", async () => {
+	const cwd = await tempDir();
+	const deck = "montage.pptx";
+	await call("ppt_create", { path: deck }, cwd);
+	await call("ppt_clone", { path: deck, source: 1, count: 2 }, cwd);
+	const shot = await call("ppt_shot", { path: deck, slides: "1-3", dpi: 70, montage: 2 }, cwd);
+	const images = shot.content.filter((block: any) => block.type === "image");
+	assert.equal(images.length, 1);
+	assert.equal(shot.details.montage.cols, 2);
+	assert.equal(shot.details.slides.length, 3);
+	assert.ok(shot.details.montage.px[0] > 600);
 });
 
 test("create refuses overwrite and delete refuses emptying the deck", async () => {
